@@ -50,3 +50,6 @@ line-length = 120
 
 [tool.ruff.format]
 quote-style = "single"
+
+[tool.uv.workspace]
+members = ["impls"]

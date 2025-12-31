@@ -1,0 +1,19 @@
+[project]
+name = "impls"
+version = "0.1.0"
+description = "OGBench training implementations"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ogbench",
+    "jax[cuda12]>=0.4.26",
+    "flax>=0.8.4",
+    "distrax>=0.1.5",
+    "ml_collections",
+    "matplotlib",
+    "moviepy",
+    "wandb",
+]
+
+[tool.uv.sources]
+ogbench = { workspace = true }

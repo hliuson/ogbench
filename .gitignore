@@ -6,3 +6,17 @@ dist/
 .DS_Store
 .idea/
 .ruff_cache/
+
+# Virtual environments
+.venv/
+
+# uv
+uv.lock
+
+# Experiment outputs
+impls/exp/
+impls/slurm-*.out
+nohup.out
+
+# Claude Code
+.claude/
