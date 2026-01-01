@@ -398,3 +398,113 @@ class HGCDataset(GCDataset):
                 )
 
         return batch
+
+
+@dataclasses.dataclass
+class CGCDataset(GCDataset):
+    """Dataset class for chunked goal-conditioned RL (used by DQC).
+
+    This class extends GCDataset to support action chunks for training with multi-step
+    backup horizons. It reads the following additional key from the config:
+    - backup_horizon: Number of steps to chunk actions together.
+    """
+
+    def __post_init__(self):
+        # Initialize base class attributes without calling super().__post_init__
+        # since CGCDataset doesn't use actor goal sampling.
+        self.size = self.dataset.size
+
+        # Pre-compute trajectory boundaries.
+        (self.terminal_locs,) = np.nonzero(self.dataset['terminals'] > 0)
+        self.initial_locs = np.concatenate([[0], self.terminal_locs[:-1] + 1])
+        assert self.terminal_locs[-1] == self.size - 1
+
+        # Assert value probabilities sum to 1.
+        assert np.isclose(
+            self.config['value_p_curgoal'] + self.config['value_p_trajgoal'] + self.config['value_p_randomgoal'], 1.0
+        )
+
+        # Set valid_idxs for action chunks - exclude states too close to terminal.
+        cur_idx = 0
+        valid_idxs = []
+
+        for terminal_idx in self.terminal_locs:
+            valid_idxs.append(np.arange(cur_idx, terminal_idx + 1 - self.config['backup_horizon']))
+            cur_idx = terminal_idx + 1
+        self.valid_idxs = np.concatenate(valid_idxs)
+
+    def sample(self, batch_size, idxs=None, evaluation=False):
+        """Sample a batch of transitions with action chunks.
+
+        Args:
+            batch_size: Batch size.
+            idxs: Indices of the transitions to sample. If None, random indices are sampled.
+            evaluation: Whether to sample for evaluation.
+        """
+        if idxs is None:
+            idxs = self.valid_idxs[np.random.randint(len(self.valid_idxs), size=batch_size)]
+
+        batch = self.dataset.sample(batch_size, idxs)
+        if self.config['frame_stack'] is not None:
+            batch['observations'] = self.get_observations(idxs)
+            batch['next_observations'] = self.get_observations(idxs + 1)
+
+        final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+
+        # Sample high-level value goals.
+        high_value_goal_idxs = self.sample_goals(
+            idxs,
+            self.config['value_p_curgoal'],
+            self.config['value_p_trajgoal'],
+            self.config['value_p_randomgoal'],
+            self.config['value_geom_sample'],
+        )
+
+        # Compute next indices for backup.
+        high_value_next_idxs, high_value_backup_horizon = self._compute_high_next_idxs(
+            idxs,
+            final_state_idxs,
+            high_value_goal_idxs,
+            self.config['backup_horizon'],
+        )
+
+        batch['high_value_goals'] = self.get_observations(high_value_goal_idxs)
+        batch['high_value_next_observations'] = self.get_observations(high_value_next_idxs)
+
+        # Compute action chunks.
+        chunk_offsets = np.arange(self.config['backup_horizon'])
+        chunk_idxs = np.minimum(idxs[:, None] + chunk_offsets, final_state_idxs[:, None])
+        batch['valids'] = (idxs[:, None] + chunk_offsets <= final_state_idxs[:, None]).astype(float)
+        batch['high_value_action_chunks'] = self.dataset['actions'][chunk_idxs].reshape(batch_size, -1)
+
+        # Compute rewards and masks.
+        high_value_successes = (high_value_backup_horizon < self.config['backup_horizon']).astype(float)
+        batch['high_value_backup_horizon'] = high_value_backup_horizon
+        batch['high_value_masks'] = 1.0 - high_value_successes
+        batch['high_value_rewards'] = (self.config['discount'] ** high_value_backup_horizon) * high_value_successes
+
+        # One-step info (for compatibility).
+        successes = (idxs == high_value_goal_idxs).astype(float)
+        batch['masks'] = 1.0 - successes
+        batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
+
+        if self.config['p_aug'] is not None and not evaluation:
+            if np.random.rand() < self.config['p_aug']:
+                self.augment(batch, ['observations', 'next_observations', 'high_value_goals', 'high_value_next_observations'])
+
+        return batch
+
+    def _compute_high_next_idxs(self, idxs, final_state_idxs, high_goal_idxs, backup_horizon):
+        """Compute the next indices for high-level goals."""
+        batch_size = len(idxs)
+        backup_horizon_arr = np.full(batch_size, backup_horizon)
+
+        # Clip to the end of the trajectory.
+        backup_horizon_arr = np.minimum(backup_horizon_arr, final_state_idxs - idxs)
+
+        # Clip to the high-level goal.
+        diff_idxs = high_goal_idxs - idxs
+        should_clip = (0 <= diff_idxs) & (diff_idxs < backup_horizon_arr)
+        backup_horizon_arr = np.where(should_clip, diff_idxs, backup_horizon_arr)
+
+        return idxs + backup_horizon_arr, backup_horizon_arr
