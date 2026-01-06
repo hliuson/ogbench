@@ -92,27 +92,35 @@ class LatentDynamics(nn.Module):
         return x
 
 
-class RewardProbe(nn.Module):
-    """Linear probe for reward prediction.
+class RewardPredictor(nn.Module):
+    """Reward predictor that predicts reward given latent state and goal.
 
-    Used to evaluate representation quality by predicting rewards from
-    frozen encoder outputs.
+    Takes concatenated [z_s, z_g] as input and predicts the reward.
 
     Attributes:
-        None (single linear layer).
+        hidden_dims: Hidden layer dimensions.
+        layer_norm: Whether to apply layer normalization.
     """
 
+    hidden_dims: Sequence[int] = (256, 256)
+    layer_norm: bool = True
+
     @nn.compact
-    def __call__(self, latent):
+    def __call__(self, latent_goal):
         """Forward pass.
 
         Args:
-            latent: Latent representation from encoder.
+            latent_goal: Concatenated [z_s, z_g] tensor.
 
         Returns:
             Predicted reward scalar.
         """
-        return nn.Dense(1, kernel_init=default_init())(latent).squeeze(-1)
+        x = MLP(
+            hidden_dims=self.hidden_dims,
+            activate_final=True,
+            layer_norm=self.layer_norm,
+        )(latent_goal)
+        return nn.Dense(1, kernel_init=default_init())(x).squeeze(-1)
 
 
 class WorldModel(flax.struct.PyTreeNode):
@@ -122,8 +130,8 @@ class WorldModel(flax.struct.PyTreeNode):
     from current state and action. The loss is a simple distance metric (MSE)
     between predicted and actual next latent, with stop-gradient on the target.
 
-    The model also includes a reward probe trained with frozen encoder weights
-    to evaluate representation quality.
+    The model also includes a reward predictor that predicts rewards given
+    latent state and goal, trained jointly with the dynamics model.
 
     Attributes:
         rng: Random number generator state.
@@ -167,33 +175,37 @@ class WorldModel(flax.struct.PyTreeNode):
             'latent_std': jnp.std(z_s),
         }
 
-    def reward_probe_loss(self, batch, grad_params):
-        """Compute the reward probe loss.
+    def reward_loss(self, batch, grad_params):
+        """Compute the reward prediction loss.
 
-        Trains a linear probe to predict rewards from frozen encoder outputs.
-        This is used to evaluate representation quality.
+        Predicts rewards from latent state and goal, trained jointly
+        with the encoder.
 
         Args:
-            batch: Batch dictionary with 'observations' and 'rewards'.
+            batch: Batch dictionary with 'observations', 'value_goals', and 'rewards'.
             grad_params: Parameters to compute gradients for.
 
         Returns:
             Tuple of (loss, info_dict).
         """
-        # Get latents with stop-gradient (frozen encoder)
-        z_s = self.network.select('encoder')(batch['observations'])  # stop-grad
-        z_s = jax.lax.stop_gradient(z_s)
+        # Encode observations and goals
+        z_s = self.network.select('encoder')(batch['observations'], params=grad_params)
+        z_g = self.network.select('encoder')(batch['value_goals'], params=grad_params)
 
-        # Predict rewards
-        pred_rewards = self.network.select('reward_probe')(z_s, params=grad_params)
+        # Predict rewards from [z_s, z_g]
+        pred_rewards = self.network.select('reward_predictor')(
+            jnp.concatenate([z_s, z_g], axis=-1),
+            params=grad_params,
+        )
 
         # MSE loss for reward prediction
-        reward_probe_loss = jnp.mean((pred_rewards - batch['rewards']) ** 2)
+        reward_loss = jnp.mean((pred_rewards - batch['rewards']) ** 2)
 
-        return reward_probe_loss, {
-            'reward_probe_loss': reward_probe_loss,
-            'reward_probe_pred_mean': jnp.mean(pred_rewards),
-            'reward_probe_pred_std': jnp.std(pred_rewards),
+        return reward_loss, {
+            'reward_loss': reward_loss,
+            'reward_pred_mean': jnp.mean(pred_rewards),
+            'reward_pred_std': jnp.std(pred_rewards),
+            'reward_target_mean': jnp.mean(batch['rewards']),
         }
 
     @jax.jit
@@ -215,15 +227,15 @@ class WorldModel(flax.struct.PyTreeNode):
         for k, v in dynamics_info.items():
             info[f'dynamics/{k}'] = v
 
-        # Reward probe loss (representation quality metric)
-        if self.config['use_reward_probe']:
-            reward_probe_loss, reward_probe_info = self.reward_probe_loss(batch, grad_params)
-            for k, v in reward_probe_info.items():
-                info[f'reward_probe/{k}'] = v
+        # Reward prediction loss
+        if self.config['use_reward_loss']:
+            reward_loss, reward_info = self.reward_loss(batch, grad_params)
+            for k, v in reward_info.items():
+                info[f'reward/{k}'] = v
         else:
-            reward_probe_loss = 0.0
+            reward_loss = 0.0
 
-        loss = dynamics_loss + self.config['reward_probe_coef'] * reward_probe_loss
+        loss = dynamics_loss + self.config['reward_loss_coef'] * reward_loss
         return loss, info
 
     @jax.jit
@@ -328,18 +340,21 @@ class WorldModel(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
         )
 
-        # Define reward probe
-        reward_probe_def = RewardProbe()
+        # Define reward predictor
+        reward_predictor_def = RewardPredictor(
+            hidden_dims=config['reward_hidden_dims'],
+            layer_norm=config['layer_norm'],
+        )
 
-        # Example latent for dynamics initialization
+        # Example inputs for initialization
         ex_latent_action = jnp.zeros((ex_observations.shape[0], latent_dim + action_dim))
-        ex_latent = jnp.zeros((ex_observations.shape[0], latent_dim))
+        ex_latent_goal = jnp.zeros((ex_observations.shape[0], latent_dim * 2))  # [z_s, z_g]
 
         # Build network dict
         network_info = dict(
             encoder=(encoder_def, (ex_observations,)),
             dynamics=(dynamics_def, (ex_latent_action,)),
-            reward_probe=(reward_probe_def, (ex_latent,)),
+            reward_predictor=(reward_predictor_def, (ex_latent_goal,)),
         )
 
         networks = {k: v[0] for k, v in network_info.items()}
@@ -367,11 +382,12 @@ def get_config():
             latent_dim=256,  # Latent representation dimension.
             encoder_hidden_dims=(256, 256),  # Encoder MLP hidden dimensions (for state obs).
             dynamics_hidden_dims=(256, 256),  # Dynamics MLP hidden dimensions.
+            reward_hidden_dims=(256, 256),  # Reward predictor hidden dimensions.
             layer_norm=True,  # Whether to use layer normalization.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None for state, 'impala_small' for pixels).
-            # Reward probe hyperparameters.
-            use_reward_probe=True,  # Whether to train the reward probe.
-            reward_probe_coef=0.1,  # Coefficient for reward probe loss.
+            # Reward prediction hyperparameters.
+            use_reward_loss=True,  # Whether to train the reward predictor.
+            reward_loss_coef=1.0,  # Coefficient for reward prediction loss.
             # Dataset hyperparameters (for compatibility with main.py).
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.0,  # Probability of using the current state as the value goal.
