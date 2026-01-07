@@ -124,6 +124,13 @@ class AsyncEvaluator:
 
         The agent weights are cloned before submission so training can continue.
         """
+        if self.num_pending() >= self.max_pending:
+            print(
+                f'Warning: eval backlog at step {step} '
+                f'({self.num_pending()} pending, max {self.max_pending}). '
+                'Consider reducing eval frequency, lowering eval episodes, '
+                'or increasing parallel eval capacity.'
+            )
         # Clone agent for evaluation
         eval_agent = self._clone_agent(agent)
 

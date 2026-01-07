@@ -48,6 +48,12 @@ def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
     setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
+    wandb.define_metric('train_step')
+    wandb.define_metric('training/*', step_metric='train_step')
+    wandb.define_metric('validation/*', step_metric='train_step')
+    wandb.define_metric('time/*', step_metric='train_step')
+    wandb.define_metric('eval_step')
+    wandb.define_metric('evaluation/*', step_metric='eval_step')
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
@@ -102,7 +108,8 @@ def main(_):
         if FLAGS.video_episodes > 0 and renders:
             video = get_wandb_video(renders=renders, n_cols=num_tasks)
             eval_metrics['video'] = video
-        wandb.log(eval_metrics, step=step)
+        eval_metrics['eval_step'] = step
+        wandb.log(eval_metrics)
         eval_logger.log(eval_metrics, step=step)
 
     def run_sync_evaluation(eval_agent, step):
@@ -151,8 +158,9 @@ def main(_):
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
+            train_metrics['train_step'] = i
             last_time = time.time()
-            wandb.log(train_metrics, step=i)
+            wandb.log(train_metrics)
             train_logger.log(train_metrics, step=i)
 
         # Check for completed async evaluations.
