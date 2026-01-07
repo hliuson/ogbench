@@ -13,6 +13,7 @@ from agents import agents
 from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
+from utils.async_evaluation import AsyncEvaluator
 from utils.evaluation import evaluate
 from utils.flax_utils import restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
@@ -38,6 +39,7 @@ flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
+flags.DEFINE_integer('parallel_eval', 1, 'Whether to run evaluation in parallel with training.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
@@ -89,6 +91,50 @@ def main(_):
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
     eval_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'eval.csv'))
+
+    # Set up async evaluator if parallel evaluation is enabled.
+    task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
+    num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
+    async_evaluator = AsyncEvaluator(max_pending=1, eval_on_cpu=FLAGS.eval_on_cpu) if FLAGS.parallel_eval else None
+
+    def log_eval_result(eval_metrics, renders, step):
+        """Log evaluation results to wandb and csv."""
+        if FLAGS.video_episodes > 0 and renders:
+            video = get_wandb_video(renders=renders, n_cols=num_tasks)
+            eval_metrics['video'] = video
+        wandb.log(eval_metrics, step=step)
+        eval_logger.log(eval_metrics, step=step)
+
+    def run_sync_evaluation(eval_agent, step):
+        """Run evaluation synchronously (blocking)."""
+        renders = []
+        eval_metrics = {}
+        overall_metrics = defaultdict(list)
+        for task_id in tqdm.trange(1, num_tasks + 1):
+            task_name = task_infos[task_id - 1]['task_name']
+            eval_info, trajs, cur_renders = evaluate(
+                agent=eval_agent,
+                env=env,
+                task_id=task_id,
+                config=config,
+                num_eval_episodes=FLAGS.eval_episodes,
+                num_video_episodes=FLAGS.video_episodes,
+                video_frame_skip=FLAGS.video_frame_skip,
+                eval_temperature=FLAGS.eval_temperature,
+                eval_gaussian=FLAGS.eval_gaussian,
+            )
+            renders.extend(cur_renders)
+            metric_names = ['success']
+            eval_metrics.update(
+                {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
+            )
+            for k, v in eval_info.items():
+                if k in metric_names:
+                    overall_metrics[k].append(v)
+        for k, v in overall_metrics.items():
+            eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
+        log_eval_result(eval_metrics, renders, step)
+
     first_time = time.time()
     last_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
@@ -109,51 +155,45 @@ def main(_):
             wandb.log(train_metrics, step=i)
             train_logger.log(train_metrics, step=i)
 
+        # Check for completed async evaluations.
+        if async_evaluator is not None:
+            for result in async_evaluator.get_completed_results():
+                log_eval_result(result.metrics, result.renders, result.step)
+
         # Evaluate agent.
         if i == 1 or i % FLAGS.eval_interval == 0:
-            if FLAGS.eval_on_cpu:
-                eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
-            else:
-                eval_agent = agent
-            renders = []
-            eval_metrics = {}
-            overall_metrics = defaultdict(list)
-            task_infos = env.unwrapped.task_infos if hasattr(env.unwrapped, 'task_infos') else env.task_infos
-            num_tasks = FLAGS.eval_tasks if FLAGS.eval_tasks is not None else len(task_infos)
-            for task_id in tqdm.trange(1, num_tasks + 1):
-                task_name = task_infos[task_id - 1]['task_name']
-                eval_info, trajs, cur_renders = evaluate(
-                    agent=eval_agent,
+            if async_evaluator is not None:
+                # Submit evaluation to run in background (non-blocking).
+                async_evaluator.submit_evaluation(
+                    agent=agent,
                     env=env,
-                    task_id=task_id,
+                    step=i,
                     config=config,
-                    num_eval_episodes=FLAGS.eval_episodes,
-                    num_video_episodes=FLAGS.video_episodes,
+                    task_infos=task_infos,
+                    num_tasks=num_tasks,
+                    eval_episodes=FLAGS.eval_episodes,
+                    video_episodes=FLAGS.video_episodes,
                     video_frame_skip=FLAGS.video_frame_skip,
                     eval_temperature=FLAGS.eval_temperature,
                     eval_gaussian=FLAGS.eval_gaussian,
                 )
-                renders.extend(cur_renders)
-                metric_names = ['success']
-                eval_metrics.update(
-                    {f'evaluation/{task_name}_{k}': v for k, v in eval_info.items() if k in metric_names}
-                )
-                for k, v in eval_info.items():
-                    if k in metric_names:
-                        overall_metrics[k].append(v)
-            for k, v in overall_metrics.items():
-                eval_metrics[f'evaluation/overall_{k}'] = np.mean(v)
-
-            if FLAGS.video_episodes > 0:
-                video = get_wandb_video(renders=renders, n_cols=num_tasks)
-                eval_metrics['video'] = video
-
-            wandb.log(eval_metrics, step=i)
-            eval_logger.log(eval_metrics, step=i)
+            else:
+                # Run evaluation synchronously (blocking).
+                if FLAGS.eval_on_cpu:
+                    eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
+                else:
+                    eval_agent = agent
+                run_sync_evaluation(eval_agent, i)
 
         # Save agent.
         if i % FLAGS.save_interval == 0:
             save_agent(agent, FLAGS.save_dir, i)
+
+    # Wait for any remaining async evaluations to complete.
+    if async_evaluator is not None:
+        for result in async_evaluator.wait_for_all():
+            log_eval_result(result.metrics, result.renders, result.step)
+        async_evaluator.shutdown()
 
     train_logger.close()
     eval_logger.close()
