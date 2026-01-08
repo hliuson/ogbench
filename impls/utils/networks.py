@@ -453,55 +453,6 @@ class GCMRNValue(nn.Module):
             return v
 
 
-class ActorVectorField(nn.Module):
-    """Vector field actor for flow-based policies.
-
-    This module is used for flow matching / diffusion-based policy learning.
-
-    Attributes:
-        hidden_dims: Hidden layer dimensions.
-        action_dim: Action dimension.
-        layer_norm: Whether to apply layer normalization.
-        gc_encoder: Optional GCEncoder module to encode the inputs.
-    """
-
-    hidden_dims: Sequence[int]
-    action_dim: int
-    layer_norm: bool = False
-    gc_encoder: nn.Module = None
-
-    def setup(self):
-        self.mlp = MLP((*self.hidden_dims, self.action_dim), activate_final=False, layer_norm=self.layer_norm)
-
-    def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
-        """Compute the vector field.
-
-        Args:
-            observations: Observations.
-            goals: Goals (optional).
-            actions: Actions (noisy actions at time t).
-            times: Time values in [0, 1].
-            is_encoded: Whether the inputs are already encoded.
-        """
-        if not is_encoded and self.gc_encoder is not None:
-            if goals is None:
-                inputs = self.gc_encoder(observations)
-            else:
-                inputs = self.gc_encoder(observations, goals)
-        else:
-            if goals is None:
-                inputs = observations
-            else:
-                inputs = jnp.concatenate([observations, goals], axis=-1)
-
-        if times is None:
-            inputs = jnp.concatenate([inputs, actions], axis=-1)
-        else:
-            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
-
-        return self.mlp(inputs)
-
-
 class GCIQEValue(nn.Module):
     """Interval quasimetric embedding (IQE) value function.
 

@@ -1,5 +1,4 @@
 from agents.crl import CRLAgent
-from agents.dqc import DQCAgent
 from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
 from agents.gcivl import GCIVLAgent
@@ -9,7 +8,6 @@ from agents.sac import SACAgent
 
 agents = dict(
     crl=CRLAgent,
-    dqc=DQCAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,
     gcivl=GCIVLAgent,
