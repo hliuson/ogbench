@@ -9,6 +9,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
+import numpy as np
 
 nonpytree_field = functools.partial(flax.struct.field, pytree_node=False)
 
@@ -199,4 +200,148 @@ def restore_agent(agent, restore_path, restore_epoch):
 
     print(f'Restored from {restore_path}')
 
-    return agent
+
+def save_pretrain_state(state, target_params, save_dir, step, prefix='pretrain'):
+    """Save a pretraining state and target parameters to a file."""
+    save_dict = dict(
+        state=flax.serialization.to_state_dict(state),
+        target_params=flax.serialization.to_state_dict(target_params),
+    )
+    save_path = os.path.join(save_dir, f'{prefix}_checkpoint_{step}.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(save_dict, f)
+
+    print(f'Saved to {save_path}')
+
+
+def restore_pretrain_state(state, target_params, restore_path, restore_step, prefix='pretrain'):
+    """Restore a pretraining state and target parameters from a file."""
+    candidates = glob.glob(restore_path)
+
+    assert len(candidates) == 1, f'Found {len(candidates)} candidates: {candidates}'
+
+    restore_path = candidates[0] + f'/{prefix}_checkpoint_{restore_step}.pkl'
+
+    with open(restore_path, 'rb') as f:
+        load_dict = pickle.load(f)
+
+    state = flax.serialization.from_state_dict(state, load_dict['state'])
+    target_params = flax.serialization.from_state_dict(target_params, load_dict['target_params'])
+
+    print(f'Restored from {restore_path}')
+    return state, target_params
+
+
+def save_encoder_params(encoder_params, save_dir, step, prefix='encoder'):
+    """Save encoder parameters to a file."""
+    save_dict = dict(
+        encoder_params=flax.serialization.to_state_dict(encoder_params),
+    )
+    save_path = os.path.join(save_dir, f'{prefix}_params_{step}.pkl')
+    with open(save_path, 'wb') as f:
+        pickle.dump(save_dict, f)
+
+    print(f'Saved to {save_path}')
+
+
+def load_encoder_params(restore_path, restore_step, prefix='encoder'):
+    """Load encoder parameters from a file."""
+    candidates = glob.glob(restore_path)
+
+    assert len(candidates) == 1, f'Found {len(candidates)} candidates: {candidates}'
+
+    restore_path = candidates[0] + f'/{prefix}_params_{restore_step}.pkl'
+
+    with open(restore_path, 'rb') as f:
+        load_dict = pickle.load(f)
+
+    print(f'Loaded encoder params from {restore_path}')
+    return load_dict['encoder_params']
+
+
+def _tree_matches(tree, template):
+    if isinstance(template, (dict, flax.core.FrozenDict)):
+        if not isinstance(tree, (dict, flax.core.FrozenDict)):
+            return False
+        if set(tree.keys()) != set(template.keys()):
+            return False
+        return all(_tree_matches(tree[k], template[k]) for k in template.keys())
+    return np.shape(tree) == np.shape(template)
+
+
+def _path_matches_key(path, match_key):
+    """Check if any path component contains the match_key as a substring.
+
+    This allows match_key='high_encoder' to match paths like ('modules_high_encoder', 'encoder').
+    """
+    return any(match_key in component for component in path)
+
+
+def inject_encoder_params(params, encoder_params, match_key=None):
+    """Inject encoder parameters into any matching subtree of params.
+
+    Args:
+        params: The full parameter tree to inject into.
+        encoder_params: The encoder parameters to inject.
+        match_key: Optional string to filter which subtrees to inject into.
+            Uses substring matching, so 'high_encoder' will match paths
+            containing 'modules_high_encoder', 'high_encoder', etc.
+
+    Returns:
+        Tuple of (new_params, count, injected_paths) where count is the number
+        of injections and injected_paths is a list of path tuples.
+    """
+    params_is_frozen = isinstance(params, flax.core.FrozenDict)
+    params_dict = flax.core.unfreeze(params) if params_is_frozen else params
+    encoder_params_dict = (
+        flax.core.unfreeze(encoder_params)
+        if isinstance(encoder_params, flax.core.FrozenDict)
+        else encoder_params
+    )
+    count = 0
+    injected_paths = []
+
+    def replace_subtree(path, tree):
+        nonlocal count
+        if (match_key is None or _path_matches_key(path, match_key)) and _tree_matches(tree, encoder_params_dict):
+            count += 1
+            injected_paths.append(path)
+            return encoder_params_dict
+        if isinstance(tree, dict):
+            return {k: replace_subtree(path + (k,), v) for k, v in tree.items()}
+        return tree
+
+    new_params = replace_subtree((), params_dict)
+    if count == 0:
+        if match_key is None:
+            raise ValueError('No matching encoder subtrees found to inject.')
+        raise ValueError(f'No matching encoder subtrees found to inject with match_key={match_key}.')
+    if params_is_frozen:
+        new_params = flax.core.freeze(new_params)
+    return new_params, count, injected_paths
+
+
+def print_param_tree(params, indent=0, max_depth=None):
+    """Print the parameter tree structure with shapes.
+
+    Args:
+        params: The parameter tree to print.
+        indent: Current indentation level.
+        max_depth: Maximum depth to print (None for unlimited).
+    """
+    if max_depth is not None and indent >= max_depth:
+        return
+
+    prefix = '  ' * indent
+    if isinstance(params, (dict, flax.core.FrozenDict)):
+        for key in sorted(params.keys()):
+            value = params[key]
+            if isinstance(value, (dict, flax.core.FrozenDict)):
+                print(f'{prefix}{key}/')
+                print_param_tree(value, indent + 1, max_depth)
+            else:
+                shape = np.shape(value)
+                print(f'{prefix}{key}: {shape}')
+    else:
+        shape = np.shape(params)
+        print(f'{prefix}{shape}')

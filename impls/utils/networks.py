@@ -273,21 +273,31 @@ class GCValue(nn.Module):
 
     Attributes:
         hidden_dims: Hidden layer dimensions.
+        output_dim: Output dimension (set to None for scalar output).
+        mlp_class: MLP class.
         layer_norm: Whether to apply layer normalization.
         ensemble: Whether to ensemble the value function.
+        num_ensembles: Number of ensemble components (overrides ensemble when set).
         gc_encoder: Optional GCEncoder module to encode the inputs.
     """
 
     hidden_dims: Sequence[int]
+    output_dim: int = None
+    mlp_class: Any = MLP
     layer_norm: bool = True
     ensemble: bool = True
+    num_ensembles: int = None
     gc_encoder: nn.Module = None
 
     def setup(self):
-        mlp_module = MLP
-        if self.ensemble:
-            mlp_module = ensemblize(mlp_module, 2)
-        value_net = mlp_module((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+        mlp_module = self.mlp_class
+        num_ensembles = self.num_ensembles
+        if num_ensembles is None:
+            num_ensembles = 2 if self.ensemble else 1
+        if num_ensembles > 1:
+            mlp_module = ensemblize(mlp_module, num_ensembles)
+        output_dim = self.output_dim if self.output_dim is not None else 1
+        value_net = mlp_module((*self.hidden_dims, output_dim), activate_final=False, layer_norm=self.layer_norm)
 
         self.value_net = value_net
 
@@ -300,7 +310,10 @@ class GCValue(nn.Module):
             actions: Actions (optional).
         """
         if self.gc_encoder is not None:
-            inputs = [self.gc_encoder(observations, goals)]
+            if goals is None:
+                inputs = [self.gc_encoder(observations)]
+            else:
+                inputs = [self.gc_encoder(observations, goals)]
         else:
             inputs = [observations]
             if goals is not None:
@@ -309,7 +322,9 @@ class GCValue(nn.Module):
             inputs.append(actions)
         inputs = jnp.concatenate(inputs, axis=-1)
 
-        v = self.value_net(inputs).squeeze(-1)
+        v = self.value_net(inputs)
+        if self.output_dim is None:
+            v = v.squeeze(-1)
 
         return v
 
@@ -515,3 +530,172 @@ class GCIQEValue(nn.Module):
             return v, phi_s, phi_g
         else:
             return v
+
+
+class ResMLPNetwork(nn.Module):
+    """ResMLP backbone network using residual blocks with LayerNorm and Swish.
+
+    From "1000 Layer Networks for Self-Supervised RL" (Blumenthal et al., 2025).
+    https://arxiv.org/abs/2503.14858
+
+    Architecture: FCLayer → [ResMLPBlock] × num_blocks → Dense(output_dim)
+    - FCLayer: Dense → LayerNorm → Swish
+    - ResMLPBlock: 4 × FCLayer + residual connection
+
+    Attributes:
+        hidden_dim: Hidden dimension (same for all layers due to residual connections).
+        num_blocks: Number of residual blocks.
+        output_dim: Output dimension.
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 2
+    output_dim: int = 1
+
+    @nn.compact
+    def __call__(self, x):
+        # Initial projection to hidden_dim
+        x = nn.Dense(self.hidden_dim)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.swish(x)
+
+        # Residual blocks
+        for _ in range(self.num_blocks):
+            residual = x
+            for _ in range(4):
+                x = nn.Dense(self.hidden_dim)(x)
+                x = nn.LayerNorm()(x)
+                x = nn.swish(x)
+            x = x + residual
+
+        # Output projection
+        x = nn.Dense(self.output_dim)(x)
+        return x
+
+
+class ResMLPValue(nn.Module):
+    """Goal-conditioned value/critic function using ResMLP architecture.
+
+    Attributes:
+        hidden_dim: Hidden dimension for ResMLP.
+        num_blocks: Number of residual blocks.
+        num_ensembles: Number of ensemble components.
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 2
+    num_ensembles: int = 1
+
+    def setup(self):
+        resmlp_module = ResMLPNetwork
+        if self.num_ensembles > 1:
+            resmlp_module = ensemblize(resmlp_module, self.num_ensembles)
+        self.value_net = resmlp_module(
+            hidden_dim=self.hidden_dim,
+            num_blocks=self.num_blocks,
+            output_dim=1,
+        )
+
+    def __call__(self, observations, goals=None, actions=None):
+        """Return the value/critic function."""
+        inputs = [observations]
+        if goals is not None:
+            inputs.append(goals)
+        if actions is not None:
+            inputs.append(actions)
+        inputs = jnp.concatenate(inputs, axis=-1)
+
+        v = self.value_net(inputs)
+        v = v.squeeze(-1)
+        return v
+
+
+class ResMLPActorVectorField(nn.Module):
+    """Actor vector field for flow policies using ResMLP architecture.
+
+    Attributes:
+        hidden_dim: Hidden dimension for ResMLP.
+        num_blocks: Number of residual blocks.
+        action_dim: Action dimension.
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 2
+    action_dim: int = 1
+
+    def setup(self):
+        self.resmlp = ResMLPNetwork(
+            hidden_dim=self.hidden_dim,
+            num_blocks=self.num_blocks,
+            output_dim=self.action_dim,
+        )
+
+    @nn.compact
+    def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
+        """Return the current vector."""
+        if goals is None:
+            inputs = observations
+        else:
+            inputs = jnp.concatenate([observations, goals], axis=-1)
+        if times is None:
+            inputs = jnp.concatenate([inputs, actions], axis=-1)
+        else:
+            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
+
+        v = self.resmlp(inputs)
+        return v
+
+
+class ActorVectorField(nn.Module):
+    """Actor vector field for flow policies.
+
+    Attributes:
+        hidden_dims: Hidden layer dimensions.
+        action_dim: Action dimension.
+        mlp_class: MLP class.
+        activate_final: Whether to apply activation to the final layer.
+        layer_norm: Whether to apply layer normalization.
+        gc_encoder: Optional GCEncoder module to encode the inputs.
+    """
+
+    hidden_dims: Sequence[int]
+    action_dim: int
+    mlp_class: Any = MLP
+    activate_final: bool = False
+    layer_norm: bool = False
+    gc_encoder: nn.Module = None
+
+    def setup(self):
+        self.mlp = self.mlp_class(
+            (*self.hidden_dims, self.action_dim), activate_final=False, layer_norm=self.layer_norm
+        )
+
+    @nn.compact
+    def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
+        """Return the current vector.
+
+        Args:
+            observations: Observations.
+            goals: Goals (optional).
+            actions: Current actions.
+            times: Current times (optional).
+            is_encoded: Whether the inputs are already encoded.
+        """
+        if not is_encoded and self.gc_encoder is not None:
+            if goals is None:
+                inputs = self.gc_encoder(observations)
+            else:
+                inputs = self.gc_encoder(observations, goals)
+        else:
+            if goals is None:
+                inputs = observations
+            else:
+                inputs = jnp.concatenate([observations, goals], axis=-1)
+        if times is None:
+            inputs = jnp.concatenate([inputs, actions], axis=-1)
+        else:
+            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
+
+        v = self.mlp(inputs)
+
+        return v

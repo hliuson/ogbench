@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import random
@@ -14,7 +15,7 @@ from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
-from utils.flax_utils import restore_agent, save_agent
+from utils.flax_utils import inject_encoder_params, load_encoder_params, print_param_tree, restore_agent, save_agent
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -25,11 +26,17 @@ flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (datas
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
+flags.DEFINE_string('dataset_path', None, 'Optional dataset path override.')
+flags.DEFINE_string('encoder_restore_path', None, 'Restore path for encoder params.')
+flags.DEFINE_integer('encoder_restore_step', None, 'Restore step for encoder params.')
+flags.DEFINE_string('encoder_restore_prefix', 'encoder', 'Prefix for encoder params files.')
+flags.DEFINE_string('encoder_restore_match_key', None, 'Optional key for matching encoder params subtree.')
 
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_bool('preprocess_frame_stack', True, 'Whether to precompute frame stacks in datasets.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
@@ -38,6 +45,7 @@ flags.DEFINE_float('eval_gaussian', None, 'Action Gaussian noise for evaluation.
 flags.DEFINE_integer('video_episodes', 1, 'Number of video episodes for each task.')
 flags.DEFINE_integer('video_frame_skip', 3, 'Frame skip for videos.')
 flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
+flags.DEFINE_bool('initial_eval', False, 'Whether to run evaluation before training.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
@@ -55,15 +63,27 @@ def main(_):
 
     # Set up environment and dataset.
     config = FLAGS.agent
-    env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+    env, train_dataset, val_dataset = make_env_and_datasets(
+        FLAGS.env_name,
+        frame_stack=config['frame_stack'],
+        dataset_path=FLAGS.dataset_path,
+    )
 
     dataset_class = {
         'GCDataset': GCDataset,
         'HGCDataset': HGCDataset,
     }[config['dataset_class']]
-    train_dataset = dataset_class(Dataset.create(**train_dataset), config)
     if val_dataset is not None:
-        val_dataset = dataset_class(Dataset.create(**val_dataset), config)
+        val_dataset = dataset_class(
+            Dataset.create(**val_dataset),
+            config,
+            preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+        )
+    train_dataset = dataset_class(
+        Dataset.create(**train_dataset),
+        config,
+        preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+    )
 
     # Initialize agent.
     random.seed(FLAGS.seed)
@@ -75,16 +95,53 @@ def main(_):
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
 
     agent_class = agents[config['agent_name']]
-    agent = agent_class.create(
-        FLAGS.seed,
-        example_batch['observations'],
-        example_batch['actions'],
-        config,
-    )
+    # Some agents (sharsa) take example_batch directly to support oracle rep mode.
+    sig = inspect.signature(agent_class.create)
+    if 'example_batch' in sig.parameters:
+        agent = agent_class.create(
+            FLAGS.seed,
+            example_batch,
+            config,
+        )
+    else:
+        agent = agent_class.create(
+            FLAGS.seed,
+            example_batch['observations'],
+            example_batch['actions'],
+            config,
+        )
+
+    # Log network architecture.
+    print('\n' + '=' * 60)
+    print('Network Architecture (parameter tree):')
+    print('=' * 60)
+    print_param_tree(agent.network.params, max_depth=4)
+    print('=' * 60 + '\n')
 
     # Restore agent.
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+    if FLAGS.encoder_restore_path is not None:
+        if FLAGS.encoder_restore_step is None:
+            raise ValueError('encoder_restore_step must be set when encoder_restore_path is provided.')
+        encoder_params = load_encoder_params(
+            FLAGS.encoder_restore_path,
+            FLAGS.encoder_restore_step,
+            prefix=FLAGS.encoder_restore_prefix,
+        )
+        new_params, num_replaced, injected_paths = inject_encoder_params(
+            agent.network.params,
+            encoder_params,
+            match_key=FLAGS.encoder_restore_match_key,
+        )
+        agent = agent.replace(network=agent.network.replace(params=new_params))
+        print('\n' + '=' * 60)
+        print(f'Encoder Injection Summary:')
+        print(f'  Match key: {FLAGS.encoder_restore_match_key}')
+        print(f'  Injected into {num_replaced} subtree(s):')
+        for path in injected_paths:
+            print(f'    - {".".join(path)}')
+        print('=' * 60 + '\n')
 
     # Train agent.
     train_logger = CsvLogger(os.path.join(FLAGS.save_dir, 'train.csv'))
@@ -94,14 +151,21 @@ def main(_):
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
-        agent, update_info = agent.update(batch)
+        # Pass step to agents that support it (e.g., for warmup schedules)
+        if 'high_actor_warmup_steps' in config:
+            agent, update_info = agent.update(batch, step=i)
+        else:
+            agent, update_info = agent.update(batch)
 
         # Log metrics.
         if i % FLAGS.log_interval == 0:
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                _, val_info = agent.total_loss(val_batch, grad_params=None)
+                if 'high_actor_warmup_steps' in config:
+                    _, val_info = agent.total_loss(val_batch, grad_params=None, step=i)
+                else:
+                    _, val_info = agent.total_loss(val_batch, grad_params=None)
                 train_metrics.update({f'validation/{k}': v for k, v in val_info.items()})
             train_metrics['time/epoch_time'] = (time.time() - last_time) / FLAGS.log_interval
             train_metrics['time/total_time'] = time.time() - first_time
@@ -110,7 +174,7 @@ def main(_):
             train_logger.log(train_metrics, step=i)
 
         # Evaluate agent.
-        if i == 1 or i % FLAGS.eval_interval == 0:
+        if (FLAGS.initial_eval and i == 1) or i % FLAGS.eval_interval == 0:
             if FLAGS.eval_on_cpu:
                 eval_agent = jax.device_put(agent, device=jax.devices('cpu')[0])
             else:

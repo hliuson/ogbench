@@ -326,6 +326,26 @@ or 5-12 hours (on pixel-based tasks) on a single A5000 GPU.
 For large pixel-based datasets (e.g., `visual-puzzle-4x6-play-v0` with 5M transitions),
 up to 120GB of RAM may be required.
 
+### ATC encoder pretraining
+
+We provide a standalone ATC (Augmented Temporal Contrast) pretraining script for pixel-based encoders in `impls/pretrain_atc.py`.
+It uses frame-stacked observations and random-shift augmentation for image observations only.
+
+```shell
+cd impls
+python pretrain_atc.py \
+  --env_name=visual-antmaze-large-navigate-v0 \
+  --encoder=impala_small \
+  --frame_stack=3 \
+  --k=16
+```
+
+The script saves:
+- full ATC checkpoints: `exp/OGBench/<run_group>/<run_name>/atc_checkpoint_<step>.pkl`
+- encoder weights only: `exp/OGBench/<run_group>/<run_name>/encoder_params_<step>.pkl`
+
+To resume pretraining, pass `--restore_path` (directory or glob) and `--restore_step`.
+
 ### Tips for hyperparameters and flags
 
 To reproduce the results in the paper, you need to use the hyperparameters provided.

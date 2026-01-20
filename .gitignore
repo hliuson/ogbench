@@ -15,8 +15,12 @@ uv.lock
 
 # Experiment outputs
 impls/exp/
+impls/slurm
 impls/slurm-*.out
 nohup.out
+**.out
 
 # Claude Code
 .claude/
+CLAUDE.md
+EXPERIMENTS.md

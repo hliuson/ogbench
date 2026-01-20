@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-from utils.encoders import GCEncoder, encoder_modules
+from utils.encoders import DualEncoder, GCEncoder, SplitEncoder, StopGradientEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import MLP, GCActor, GCDiscreteActor, GCValue, Identity, LengthNormalize
 
@@ -152,6 +152,26 @@ class HIQLAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
+    def _zero_encoder_grads(self, grads, freeze_high_only=False):
+        grads_is_frozen = isinstance(grads, flax.core.FrozenDict)
+        grads_dict = flax.core.unfreeze(grads) if grads_is_frozen else grads
+
+        def zero_if_encoder(path, tree):
+            if isinstance(tree, dict):
+                return {k: zero_if_encoder(path + (k,), v) for k, v in tree.items()}
+            if freeze_high_only:
+                if 'high_encoder' in path:
+                    return jax.tree_util.tree_map(jnp.zeros_like, tree)
+                return tree
+            if any(key in ('encoder', 'quantizer') for key in path):
+                return jax.tree_util.tree_map(jnp.zeros_like, tree)
+            return tree
+
+        grads_dict = zero_if_encoder((), grads_dict)
+        if grads_is_frozen:
+            grads_dict = flax.core.freeze(grads_dict)
+        return grads_dict
+
     @jax.jit
     def update(self, batch):
         """Update the agent and return a new agent with information dictionary."""
@@ -160,7 +180,31 @@ class HIQLAgent(flax.struct.PyTreeNode):
         def loss_fn(grad_params):
             return self.total_loss(batch, grad_params, rng=rng)
 
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        freeze_encoder = self.config.get('freeze_encoder', False)
+        freeze_high = self.config.get('freeze_high_encoder', False)
+        if freeze_encoder or freeze_high:
+            grads, info = jax.grad(loss_fn, has_aux=True)(self.network.params)
+            grads = self._zero_encoder_grads(grads, freeze_high_only=freeze_high and not freeze_encoder)
+
+            grad_max = jax.tree_util.tree_map(jnp.max, grads)
+            grad_min = jax.tree_util.tree_map(jnp.min, grads)
+            grad_norm = jax.tree_util.tree_map(jnp.linalg.norm, grads)
+
+            grad_max_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_max)], axis=0)
+            grad_min_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_min)], axis=0)
+            grad_norm_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_norm)], axis=0)
+
+            info.update(
+                {
+                    'grad/max': jnp.max(grad_max_flat),
+                    'grad/min': jnp.min(grad_min_flat),
+                    'grad/norm': jnp.linalg.norm(grad_norm_flat, ord=1),
+                }
+            )
+
+            new_network = self.network.apply_gradients(grads=grads)
+        else:
+            new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'value')
 
         return self.replace(network=new_network, rng=new_rng), info
@@ -217,9 +261,30 @@ class HIQLAgent(flax.struct.PyTreeNode):
             action_dim = ex_actions.shape[-1]
 
         # Define (state-dependent) subgoal representation phi([s; g]) that outputs a length-normalized vector.
-        if config['encoder'] is not None:
+        def make_base_encoder():
             encoder_module = encoder_modules[config['encoder']]
-            goal_rep_seq = [encoder_module()]
+            encoder_def = encoder_module()
+            return encoder_def
+
+        def make_encoder(concat=False):
+            freeze_all = config.get('freeze_encoder', False)
+            freeze_high = config.get('freeze_high_encoder', False) or freeze_all
+            encoder_def = make_base_encoder()
+            if config.get('dual_encoder', False):
+                encoder_def = DualEncoder(
+                    high_encoder=make_base_encoder(),
+                    low_encoder=make_base_encoder(),
+                    freeze_high=freeze_high,
+                    freeze_low=freeze_all,
+                )
+            elif freeze_all:
+                encoder_def = StopGradientEncoder(encoder=encoder_def)
+            if concat and config.get('split_concat_encoder', False):
+                encoder_def = SplitEncoder(encoder=encoder_def)
+            return encoder_def
+
+        if config['encoder'] is not None:
+            goal_rep_seq = [make_encoder(concat=True)]
         else:
             goal_rep_seq = []
         goal_rep_seq.append(
@@ -241,12 +306,12 @@ class HIQLAgent(flax.struct.PyTreeNode):
             # encoder for subgoal representations.
 
             # Value: V(encoder^V(s), phi([s; g]))
-            value_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
-            target_value_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
+            value_encoder_def = GCEncoder(state_encoder=make_encoder(), concat_encoder=goal_rep_def)
+            target_value_encoder_def = GCEncoder(state_encoder=make_encoder(), concat_encoder=goal_rep_def)
             # Low-level actor: pi^l(. | encoder^l(s), phi([s; w]))
-            low_actor_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
+            low_actor_encoder_def = GCEncoder(state_encoder=make_encoder(), concat_encoder=goal_rep_def)
             # High-level actor: pi^h(. | encoder^h([s; g]))
-            high_actor_encoder_def = GCEncoder(concat_encoder=encoder_module())
+            high_actor_encoder_def = GCEncoder(concat_encoder=make_encoder(concat=True))
         else:
             # State-based environments only use the pre-defined shared encoder for subgoal representations.
 
@@ -337,6 +402,18 @@ def get_config():
             const_std=True,  # Whether to use constant standard deviation for the actors.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            freeze_encoder=False,  # Whether to freeze encoder weights.
+            dual_encoder=False,  # Whether to concatenate frozen high- and trainable low-level encoders.
+            freeze_high_encoder=False,  # Whether to freeze only the high-level encoder.
+            split_concat_encoder=False,  # Whether to split concatenated state-goal inputs for shared encoding.
+            vq_enabled=False,  # Whether to use discrete factorized quantization.
+            vq_codebook_size=256,  # VQ codebook size.
+            vq_num_factors=16,  # Number of VQ factors.
+            vq_beta=0.25,  # VQ commitment loss weight.
+            vq_ema_decay=0.99,  # VQ EMA decay.
+            vq_ema_eps=1e-5,  # VQ EMA epsilon.
+            vq_expire_codes=False,  # Whether to reinitialize rarely used codes.
+            vq_expire_threshold=0.1,  # Expiration threshold as fraction of mean usage.
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             value_p_curgoal=0.2,  # Probability of using the current state as the value goal.

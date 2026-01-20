@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
-from utils.encoders import GCEncoder, encoder_modules
+from utils.encoders import DualEncoder, GCEncoder, encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import GCActor, GCDiscreteActor, GCDiscreteCritic, GCValue
 
@@ -153,6 +153,19 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         )
         network.params[f'modules_target_{module_name}'] = new_target_params
 
+    def _zero_encoder_grads(self, grads):
+        grads_is_frozen = isinstance(grads, flax.core.FrozenDict)
+        grads_dict = flax.core.unfreeze(grads) if grads_is_frozen else grads
+        for module_name in ('modules_value', 'modules_critic', 'modules_actor'):
+            if module_name in grads_dict and 'gc_encoder' in grads_dict[module_name]:
+                grads_dict[module_name]['gc_encoder'] = jax.tree_util.tree_map(
+                    jnp.zeros_like,
+                    grads_dict[module_name]['gc_encoder'],
+                )
+        if grads_is_frozen:
+            grads_dict = flax.core.freeze(grads_dict)
+        return grads_dict
+
     @jax.jit
     def update(self, batch):
         """Update the agent and return a new agent with information dictionary."""
@@ -161,7 +174,30 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         def loss_fn(grad_params):
             return self.total_loss(batch, grad_params, rng=rng)
 
-        new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+        if self.config.get('freeze_encoder', False):
+            grads, info = jax.grad(loss_fn, has_aux=True)(self.network.params)
+            grads = self._zero_encoder_grads(grads)
+
+            grad_max = jax.tree_util.tree_map(jnp.max, grads)
+            grad_min = jax.tree_util.tree_map(jnp.min, grads)
+            grad_norm = jax.tree_util.tree_map(jnp.linalg.norm, grads)
+
+            grad_max_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_max)], axis=0)
+            grad_min_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_min)], axis=0)
+            grad_norm_flat = jnp.concatenate([jnp.reshape(x, -1) for x in jax.tree_util.tree_leaves(grad_norm)], axis=0)
+
+            info.update(
+                {
+                    'grad/max': jnp.max(grad_max_flat),
+                    'grad/min': jnp.min(grad_min_flat),
+                    'grad/norm': jnp.linalg.norm(grad_norm_flat, ord=1),
+                }
+            )
+
+            new_network = self.network.apply_gradients(grads=grads)
+        else:
+            new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
+
         self.target_update(new_network, 'critic')
 
         return self.replace(network=new_network, rng=new_rng), info
@@ -210,9 +246,27 @@ class GCIQLAgent(flax.struct.PyTreeNode):
         encoders = dict()
         if config['encoder'] is not None:
             encoder_module = encoder_modules[config['encoder']]
-            encoders['value'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['critic'] = GCEncoder(concat_encoder=encoder_module())
-            encoders['actor'] = GCEncoder(concat_encoder=encoder_module())
+            freeze_all = config.get('freeze_encoder', False)
+            freeze_high = config.get('freeze_high_encoder', False) or freeze_all
+
+            def make_encoder():
+                """Create encoder instance - DualEncoder if enabled, else base encoder."""
+                if config.get('dual_encoder', False):
+                    return DualEncoder(
+                        high_encoder=encoder_module(),
+                        low_encoder=encoder_module(),
+                        freeze_high=freeze_high,
+                        freeze_low=freeze_all,
+                    )
+                else:
+                    return encoder_module()
+
+            # Create separate encoder instances for each network.
+            # Use state_encoder + goal_encoder (not concat_encoder) so each encoder
+            # processes obs or goal independently - matching ATC pretraining input dim.
+            encoders['value'] = GCEncoder(state_encoder=make_encoder(), goal_encoder=make_encoder())
+            encoders['critic'] = GCEncoder(state_encoder=make_encoder(), goal_encoder=make_encoder())
+            encoders['actor'] = GCEncoder(state_encoder=make_encoder(), goal_encoder=make_encoder())
 
         # Define value and actor networks.
         value_def = GCValue(
@@ -291,6 +345,9 @@ def get_config():
             const_std=True,  # Whether to use constant standard deviation for the actor.
             discrete=False,  # Whether the action space is discrete.
             encoder=ml_collections.config_dict.placeholder(str),  # Visual encoder name (None, 'impala_small', etc.).
+            freeze_encoder=False,  # Whether to freeze encoder weights.
+            dual_encoder=False,  # Whether to use dual encoder (frozen high + trainable low).
+            freeze_high_encoder=False,  # Whether to freeze only the high-level encoder.
             # Dataset hyperparameters.
             dataset_class='GCDataset',  # Dataset class name.
             value_p_curgoal=0.2,  # Probability of using the current state as the value goal.

@@ -5,6 +5,8 @@ from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
 from agents.qrl import QRLAgent
 from agents.sac import SACAgent
+from agents.sharsa import SHARSAAgent
+from agents.latent_sharsa import LatentSHARSAAgent
 
 agents = dict(
     crl=CRLAgent,
@@ -14,4 +16,6 @@ agents = dict(
     hiql=HIQLAgent,
     qrl=QRLAgent,
     sac=SACAgent,
+    sharsa=SHARSAAgent,
+    latent_sharsa=LatentSHARSAAgent,
 )

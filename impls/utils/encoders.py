@@ -1,10 +1,72 @@
 import functools
-from typing import Sequence
+from typing import Sequence, Tuple
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 
 from utils.networks import MLP
+
+
+class FCLayer(nn.Module):
+    """Fully connected layer with LayerNorm and Swish activation.
+
+    From "1000 Layer Networks for Self-Supervised RL" (Blumenthal et al., 2025).
+    https://arxiv.org/abs/2503.14858
+    """
+
+    features: int
+
+    @nn.compact
+    def __call__(self, x):
+        x = nn.Dense(self.features)(x)
+        x = nn.LayerNorm()(x)
+        x = nn.swish(x)
+        return x
+
+
+class ResMLPBlock(nn.Module):
+    """Residual block with 4 consecutive FC layers.
+
+    From "1000 Layer Networks for Self-Supervised RL" (Blumenthal et al., 2025).
+    https://arxiv.org/abs/2503.14858
+    """
+
+    features: int
+
+    @nn.compact
+    def __call__(self, x):
+        residual = x
+        for _ in range(4):
+            x = FCLayer(self.features)(x)
+        return x + residual
+
+
+class ResMLPEncoder(nn.Module):
+    """Residual MLP encoder for state-based observations.
+
+    From "1000 Layer Networks for Self-Supervised RL" (Blumenthal et al., 2025).
+    https://arxiv.org/abs/2503.14858
+
+    Architecture: FCLayer → [ResMLPBlock] × num_blocks
+    - FCLayer: Dense → LayerNorm → Swish
+    - ResMLPBlock: 4 × FCLayer + residual connection
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 2
+
+    @nn.compact
+    def __call__(self, x, train=True, cond_var=None):
+        x = FCLayer(self.hidden_dim)(x)
+        for _ in range(self.num_blocks):
+            x = ResMLPBlock(self.hidden_dim)(x)
+        return x
+
+
+# Aliases for backward compatibility
+MLPResnetBlock = ResMLPBlock
+MLPEncoder = ResMLPEncoder
 
 
 class ResnetStack(nn.Module):
@@ -99,6 +161,47 @@ class ImpalaEncoder(nn.Module):
 
         return out
 
+class DualEncoder(nn.Module):
+    """Concatenate frozen high-level and trainable low-level encoders."""
+
+    high_encoder: nn.Module
+    low_encoder: nn.Module
+    freeze_high: bool = False
+    freeze_low: bool = False
+
+    def __call__(self, x, train=True, cond_var=None):
+        high = self.high_encoder(x, train=train, cond_var=cond_var)
+        if self.freeze_high:
+            high = jax.lax.stop_gradient(high)
+        low = self.low_encoder(x, train=train, cond_var=cond_var)
+        if self.freeze_low:
+            low = jax.lax.stop_gradient(low)
+        return jnp.concatenate([high, low], axis=-1)
+
+
+class SplitEncoder(nn.Module):
+    """Apply the same encoder to a concatenated input split in half."""
+
+    encoder: nn.Module
+
+    def __call__(self, x, train=True, cond_var=None):
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(f'Input dim {x.shape[-1]} must be even to split state and goal.')
+        first, second = jnp.split(x, 2, axis=-1)
+        first_enc = self.encoder(first, train=train, cond_var=cond_var)
+        second_enc = self.encoder(second, train=train, cond_var=cond_var)
+        return jnp.concatenate([first_enc, second_enc], axis=-1)
+
+
+class StopGradientEncoder(nn.Module):
+    """Stop gradients through the wrapped encoder."""
+
+    encoder: nn.Module
+
+    def __call__(self, x, train=True, cond_var=None):
+        out = self.encoder(x, train=train, cond_var=cond_var)
+        return jax.lax.stop_gradient(out)
+
 
 class GCEncoder(nn.Module):
     """Helper module to handle inputs to goal-conditioned networks.
@@ -141,4 +244,11 @@ encoder_modules = {
     'impala_debug': functools.partial(ImpalaEncoder, num_blocks=1, stack_sizes=(4, 4)),
     'impala_small': functools.partial(ImpalaEncoder, num_blocks=1),
     'impala_large': functools.partial(ImpalaEncoder, stack_sizes=(64, 128, 128), mlp_hidden_dims=(1024,)),
+    'mlp': ResMLPEncoder,
+    'mlp_small': functools.partial(ResMLPEncoder, num_blocks=1),
+    'mlp_large': functools.partial(ResMLPEncoder, hidden_dim=512, num_blocks=4),
+    # Explicit resmlp aliases
+    'resmlp': ResMLPEncoder,
+    'resmlp_small': functools.partial(ResMLPEncoder, num_blocks=1),
+    'resmlp_large': functools.partial(ResMLPEncoder, hidden_dim=512, num_blocks=4),
 }
