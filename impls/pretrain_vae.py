@@ -13,7 +13,7 @@ import wandb
 from absl import app, flags
 
 from utils.pretraining import VAEModel
-from utils.datasets import ATCDataset
+from utils.datasets import ATCDataset, Dataset
 from utils.encoders import encoder_modules
 from utils.env_utils import make_env_and_datasets
 from utils.flax_utils import TrainState, restore_pretrain_state, save_encoder_params, save_pretrain_state
@@ -43,6 +43,25 @@ flags.DEFINE_integer('frame_stack', 3, 'Number of frames to stack.')
 flags.DEFINE_float('p_aug', 1.0, 'Probability of applying image augmentation.')
 flags.DEFINE_integer('augment_padding', 4, 'Padding size for random shift.')
 flags.DEFINE_bool('preprocess_frame_stack', True, 'Whether to precompute frame stacks in datasets.')
+flags.DEFINE_integer('shard_cache_size', 1, 'Number of observation shards to cache in memory for streaming datasets.')
+
+
+def _ensure_dataset(dataset):
+    if dataset is None:
+        return None
+    if hasattr(dataset, 'sample') and hasattr(dataset, 'size'):
+        return dataset
+    return Dataset.create(**dataset)
+
+
+def _resolve_preprocess_frame_stack(*datasets):
+    streaming = any(
+        isinstance(ds['observations'], ShardedArray) for ds in datasets if ds is not None
+    )
+    if streaming and FLAGS.preprocess_frame_stack:
+        print('Streaming dataset detected; disabling preprocess_frame_stack to avoid full preload.')
+        return False
+    return FLAGS.preprocess_frame_stack
 
 
 def vae_loss(model_def, params, batch, rng, train=True, kl_weight=1.0):
@@ -110,7 +129,11 @@ def main(_):
         FLAGS.env_name,
         frame_stack=None,
         dataset_path=FLAGS.dataset_path,
+        shard_cache_size=FLAGS.shard_cache_size,
     )
+    train_dataset = _ensure_dataset(train_dataset)
+    val_dataset = _ensure_dataset(val_dataset)
+    preprocess_frame_stack = _resolve_preprocess_frame_stack(train_dataset, val_dataset)
     dataset_config = dict(
         frame_stack=FLAGS.frame_stack,
         p_aug=FLAGS.p_aug,
@@ -119,13 +142,13 @@ def main(_):
     train_dataset = ATCDataset(
         train_dataset,
         dataset_config,
-        preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+        preprocess_frame_stack=preprocess_frame_stack,
     )
     if val_dataset is not None:
         val_dataset = ATCDataset(
             val_dataset,
             dataset_config,
-            preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+            preprocess_frame_stack=preprocess_frame_stack,
         )
 
     # Initialize model.

@@ -2,13 +2,41 @@ import copy
 from typing import Any
 
 import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import ml_collections
 import optax
 
+from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
-from utils.networks import ActorVectorField, GCValue
+from utils.networks import ActorVectorField, GCValue, ResMLPActorVectorField, ResMLPValue
+
+
+class GCValueWithEncoder(nn.Module):
+    """Goal-conditioned value network with optional state encoder."""
+
+    encoder: nn.Module
+    value: nn.Module
+
+    @nn.compact
+    def __call__(self, observations, goals, actions=None):
+        encoded_obs = self.encoder(observations)
+        if actions is not None:
+            return self.value(encoded_obs, goals, actions)
+        return self.value(encoded_obs, goals)
+
+
+class ActorVectorFieldWithEncoder(nn.Module):
+    """Actor vector field with optional state encoder."""
+
+    encoder: nn.Module
+    actor: nn.Module
+
+    @nn.compact
+    def __call__(self, observations, goals, actions, times):
+        encoded_obs = self.encoder(observations)
+        return self.actor(encoded_obs, goals, actions, times)
 
 
 class SHARSAAgent(flax.struct.PyTreeNode):
@@ -245,34 +273,77 @@ class SHARSAAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
         goal_dim = ex_goals.shape[-1]
+        mlp_hidden_dims = (config['mlp_hidden_dim'],) * config['mlp_num_layers']
 
-        # Define networks.
-        high_value_def = GCValue(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            num_ensembles=1,
-        )
-        high_critic_def = GCValue(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            num_ensembles=2,
-        )
+        # Define base networks.
+        if config['use_resmlp']:
+            high_value_base = ResMLPValue(
+                hidden_dim=config['resmlp_hidden_dim'],
+                num_blocks=config['resmlp_num_blocks'],
+                num_ensembles=1,
+            )
+            high_critic_base = ResMLPValue(
+                hidden_dim=config['resmlp_hidden_dim'],
+                num_blocks=config['resmlp_num_blocks'],
+                num_ensembles=2,
+            )
+            high_actor_flow_base = ResMLPActorVectorField(
+                hidden_dim=config['resmlp_hidden_dim'],
+                num_blocks=config['resmlp_num_blocks'],
+                action_dim=goal_dim,
+            )
+            low_actor_flow_base = ResMLPActorVectorField(
+                hidden_dim=config['resmlp_hidden_dim'],
+                num_blocks=config['resmlp_num_blocks'],
+                action_dim=action_dim,
+            )
+        else:
+            high_value_base = GCValue(
+                hidden_dims=mlp_hidden_dims,
+                layer_norm=config['layer_norm'],
+                num_ensembles=1,
+            )
+            high_critic_base = GCValue(
+                hidden_dims=mlp_hidden_dims,
+                layer_norm=config['layer_norm'],
+                num_ensembles=2,
+            )
+            high_actor_flow_base = ActorVectorField(
+                hidden_dims=mlp_hidden_dims,
+                action_dim=goal_dim,
+                layer_norm=config['layer_norm'],
+            )
+            low_actor_flow_base = ActorVectorField(
+                hidden_dims=mlp_hidden_dims,
+                action_dim=action_dim,
+                layer_norm=config['layer_norm'],
+            )
+        target_high_critic_base = copy.deepcopy(high_critic_base)
 
-        high_actor_flow_def = ActorVectorField(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=goal_dim,
-            layer_norm=config['layer_norm'],
-        )
-        low_actor_flow_def = ActorVectorField(
-            hidden_dims=config['actor_hidden_dims'],
-            action_dim=action_dim,
-            layer_norm=config['layer_norm'],
-        )
+        # Wrap with encoder if configured.
+        encoder_def = None
+        encoder_name = config.get('encoder', 'none')
+        if encoder_name != 'none':
+            encoder_module = encoder_modules[encoder_name]
+            encoder_def = encoder_module()
+
+        if encoder_def is not None:
+            high_value_def = GCValueWithEncoder(encoder=encoder_def, value=high_value_base)
+            high_critic_def = GCValueWithEncoder(encoder=encoder_def, value=high_critic_base)
+            target_high_critic_def = GCValueWithEncoder(encoder=encoder_def, value=target_high_critic_base)
+            high_actor_flow_def = ActorVectorFieldWithEncoder(encoder=encoder_def, actor=high_actor_flow_base)
+            low_actor_flow_def = ActorVectorFieldWithEncoder(encoder=encoder_def, actor=low_actor_flow_base)
+        else:
+            high_value_def = high_value_base
+            high_critic_def = high_critic_base
+            target_high_critic_def = target_high_critic_base
+            high_actor_flow_def = high_actor_flow_base
+            low_actor_flow_def = low_actor_flow_base
 
         network_info = dict(
             high_value=(high_value_def, (ex_observations, ex_goals)),
             high_critic=(high_critic_def, (ex_observations, ex_goals, ex_goals)),
-            target_high_critic=(copy.deepcopy(high_critic_def), (ex_observations, ex_goals, ex_goals)),
+            target_high_critic=(target_high_critic_def, (ex_observations, ex_goals, ex_goals)),
             high_actor_flow=(high_actor_flow_def, (ex_observations, ex_goals, ex_goals, ex_times)),
             low_actor_flow=(low_actor_flow_def, (ex_observations, ex_goals, ex_actions, ex_times)),
         )
@@ -299,8 +370,8 @@ def get_config():
             agent_name='sharsa',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
-            actor_hidden_dims=(1024, 1024, 1024, 1024),  # Actor network hidden dimensions.
-            value_hidden_dims=(1024, 1024, 1024, 1024),  # Value network hidden dimensions.
+            mlp_hidden_dim=256,  # Hidden width for all MLP networks.
+            mlp_num_layers=4,  # Number of layers for all MLP networks.
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.999,  # Discount factor.
             tau=0.005,  # Target network update rate.
@@ -311,6 +382,10 @@ def get_config():
             flow_steps=10,  # Number of flow steps.
             num_samples=32,  # Number of samples for the actor.
             discrete=False,  # Whether the action space is discrete.
+            encoder='none',  # Encoder name ('none' for no encoder, or e.g., 'impala_small').
+            use_resmlp=False,  # Whether to use ResMLP architecture for all networks.
+            resmlp_hidden_dim=64,  # Hidden dimension for all ResMLP networks.
+            resmlp_num_blocks=8,  # Number of residual blocks (4 layers each).
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             subgoal_steps=25,  # Subgoal steps.

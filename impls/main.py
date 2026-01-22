@@ -1,3 +1,4 @@
+import glob
 import inspect
 import json
 import os
@@ -37,6 +38,7 @@ flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
 flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
 flags.DEFINE_bool('preprocess_frame_stack', True, 'Whether to precompute frame stacks in datasets.')
+flags.DEFINE_integer('dataset_replace_interval', 0, 'Interval for cycling through sharded datasets (0 to disable).')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
@@ -48,6 +50,18 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 flags.DEFINE_bool('initial_eval', False, 'Whether to run evaluation before training.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
+
+
+def _ensure_dataset(dataset):
+    if dataset is None:
+        return None
+    if hasattr(dataset, 'sample') and hasattr(dataset, 'size'):
+        return dataset
+    return Dataset.create(**dataset)
+
+
+def _resolve_preprocess_frame_stack(*datasets):
+    return FLAGS.preprocess_frame_stack
 
 
 def main(_):
@@ -63,11 +77,29 @@ def main(_):
 
     # Set up environment and dataset.
     config = FLAGS.agent
+
+    # Check if dataset_path is a directory (sharded dataset)
+    dataset_shards = None
+    dataset_idx = 0
+    if FLAGS.dataset_path and os.path.isdir(FLAGS.dataset_path):
+        # Load list of sharded npz files (excluding validation files)
+        dataset_shards = [f for f in sorted(glob.glob(f'{FLAGS.dataset_path}/*.npz'))
+                         if '-val.npz' not in f]
+        if not dataset_shards:
+            raise FileNotFoundError(f"No .npz files found in {FLAGS.dataset_path}")
+        print(f"Found {len(dataset_shards)} dataset shards in {FLAGS.dataset_path}")
+        initial_dataset_path = dataset_shards[0]
+    else:
+        initial_dataset_path = FLAGS.dataset_path
+
     env, train_dataset, val_dataset = make_env_and_datasets(
         FLAGS.env_name,
         frame_stack=config['frame_stack'],
-        dataset_path=FLAGS.dataset_path,
+        dataset_path=initial_dataset_path,
     )
+    train_dataset = _ensure_dataset(train_dataset)
+    val_dataset = _ensure_dataset(val_dataset)
+    preprocess_frame_stack = _resolve_preprocess_frame_stack(train_dataset, val_dataset)
 
     dataset_class = {
         'GCDataset': GCDataset,
@@ -75,14 +107,14 @@ def main(_):
     }[config['dataset_class']]
     if val_dataset is not None:
         val_dataset = dataset_class(
-            Dataset.create(**val_dataset),
+            val_dataset,
             config,
-            preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+            preprocess_frame_stack=preprocess_frame_stack,
         )
     train_dataset = dataset_class(
-        Dataset.create(**train_dataset),
+        train_dataset,
         config,
-        preprocess_frame_stack=FLAGS.preprocess_frame_stack,
+        preprocess_frame_stack=preprocess_frame_stack,
     )
 
     # Initialize agent.
@@ -149,6 +181,23 @@ def main(_):
     first_time = time.time()
     last_time = time.time()
     for i in tqdm.tqdm(range(1, FLAGS.train_steps + 1), smoothing=0.1, dynamic_ncols=True):
+        # Cycle through dataset shards if enabled
+        if (dataset_shards is not None and FLAGS.dataset_replace_interval > 0 and
+                i % FLAGS.dataset_replace_interval == 0 and len(dataset_shards) > 1):
+            dataset_idx = (dataset_idx + 1) % len(dataset_shards)
+            print(f"\nLoading dataset shard {dataset_idx + 1}/{len(dataset_shards)}: {os.path.basename(dataset_shards[dataset_idx])}")
+            _, new_train_dataset, _ = make_env_and_datasets(
+                FLAGS.env_name,
+                frame_stack=config['frame_stack'],
+                dataset_path=dataset_shards[dataset_idx],
+            )
+            new_train_dataset = _ensure_dataset(new_train_dataset)
+            train_dataset = dataset_class(
+                new_train_dataset,
+                config,
+                preprocess_frame_stack=preprocess_frame_stack,
+            )
+
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         # Pass step to agents that support it (e.g., for warmup schedules)

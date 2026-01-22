@@ -1,5 +1,5 @@
 import copy
-from typing import Any
+from typing import Any, Sequence
 
 import flax
 import jax
@@ -16,30 +16,42 @@ from utils.networks import ActorVectorField, GCValue, MLP, ResMLPActorVectorFiel
 
 
 class SubgoalEncoder(nn.Module):
-    """Option-style subgoal encoder: (s, s', g) -> z using ResMLP + projection."""
+    """Option-style subgoal encoder: (s, s', g) -> z using shared MLP/ResMLP size."""
 
-    hidden_dim: int = 256
-    num_blocks: int = 2
+    use_resmlp: bool
+    mlp_hidden_dims: Sequence[int]
+    layer_norm: bool
+    resmlp_hidden_dim: int
+    resmlp_num_blocks: int
     z_dim: int = 8
 
     @nn.compact
     def __call__(self, x):
-        x = ResMLPEncoder(hidden_dim=self.hidden_dim, num_blocks=self.num_blocks)(x)
-        x = nn.Dense(self.z_dim)(x)
+        if self.use_resmlp:
+            x = ResMLPEncoder(hidden_dim=self.resmlp_hidden_dim, num_blocks=self.resmlp_num_blocks)(x)
+            x = nn.Dense(self.z_dim)(x)
+        else:
+            x = MLP((*self.mlp_hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
         return x
 
 
 class GoalEncoder(nn.Module):
-    """Encodes raw goal into a compact representation using ResMLP."""
+    """Encodes raw goal into a compact representation using shared MLP/ResMLP size."""
 
-    hidden_dim: int = 256
-    num_blocks: int = 2
+    use_resmlp: bool
+    mlp_hidden_dims: Sequence[int]
+    layer_norm: bool
+    resmlp_hidden_dim: int
+    resmlp_num_blocks: int
     output_dim: int = 64
 
     @nn.compact
     def __call__(self, x):
-        x = ResMLPEncoder(hidden_dim=self.hidden_dim, num_blocks=self.num_blocks)(x)
-        x = nn.Dense(self.output_dim)(x)
+        if self.use_resmlp:
+            x = ResMLPEncoder(hidden_dim=self.resmlp_hidden_dim, num_blocks=self.resmlp_num_blocks)(x)
+            x = nn.Dense(self.output_dim)(x)
+        else:
+            x = MLP((*self.mlp_hidden_dims, self.output_dim), activate_final=False, layer_norm=self.layer_norm)(x)
         return x
 
 
@@ -139,11 +151,14 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             q1_logit, q2_logit = q1, q2
             critic_loss = self.bce_loss(q1_logit, q).mean() + self.bce_loss(q2_logit, q).mean()
 
+        z_norms = jnp.linalg.norm(z_actions, axis=-1)
         return critic_loss, {
             'critic_loss': critic_loss,
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            'z_norm_mean': z_norms.mean(),
+            'z_norm_std': z_norms.std(),
         }
 
     def high_actor_loss(self, batch, grad_params, rng=None):
@@ -356,6 +371,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         action_dim = ex_actions.shape[-1]
         goal_dim = ex_goals.shape[-1]
         obs_dim = ex_observations.shape[-1]
+        mlp_hidden_dims = (config['mlp_hidden_dim'],) * config['mlp_num_layers']
 
         # Define networks.
         if config['use_resmlp']:
@@ -383,22 +399,22 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         else:
             # Use standard MLP architecture
             high_value_def = GCValue(
-                hidden_dims=config['value_hidden_dims'],
+                hidden_dims=mlp_hidden_dims,
                 layer_norm=config['layer_norm'],
                 num_ensembles=1,
             )
             high_critic_def = GCValue(
-                hidden_dims=config['value_hidden_dims'],
+                hidden_dims=mlp_hidden_dims,
                 layer_norm=config['layer_norm'],
                 num_ensembles=2,
             )
             high_actor_flow_def = ActorVectorField(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=mlp_hidden_dims,
                 action_dim=config['z_dim'],
                 layer_norm=config['layer_norm'],
             )
             low_actor_flow_def = ActorVectorField(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=mlp_hidden_dims,
                 action_dim=action_dim,
                 layer_norm=config['layer_norm'],
             )
@@ -417,10 +433,12 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             enc_dim = obs_dim
 
         # Option-style subgoal encoder: (enc(s), enc(s'), g) -> z
-        # Uses ResMLP architecture with projection to z_dim
         subgoal_encoder_def = SubgoalEncoder(
-            hidden_dim=config['subgoal_encoder_hidden_dim'],
-            num_blocks=config['subgoal_encoder_num_blocks'],
+            use_resmlp=config['use_resmlp'],
+            mlp_hidden_dims=mlp_hidden_dims,
+            layer_norm=config['layer_norm'],
+            resmlp_hidden_dim=config['resmlp_hidden_dim'],
+            resmlp_num_blocks=config['resmlp_num_blocks'],
             z_dim=config['z_dim'],
         )
         ex_subgoal_input = np.concatenate([ex_enc, ex_enc, ex_goals], axis=-1)
@@ -429,8 +447,11 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         goal_encoder_def = None
         if config['low_actor_goal_conditioned'] and config['encode_goal']:
             goal_encoder_def = GoalEncoder(
-                hidden_dim=config['goal_encoder_hidden_dim'],
-                num_blocks=config['goal_encoder_num_blocks'],
+                use_resmlp=config['use_resmlp'],
+                mlp_hidden_dims=mlp_hidden_dims,
+                layer_norm=config['layer_norm'],
+                resmlp_hidden_dim=config['resmlp_hidden_dim'],
+                resmlp_num_blocks=config['resmlp_num_blocks'],
                 output_dim=config['goal_encoder_output_dim'],
             )
             ex_encoded_goal = np.zeros((ex_observations.shape[0], config['goal_encoder_output_dim']), dtype=np.float32)
@@ -475,8 +496,8 @@ def get_config():
             agent_name='latent_sharsa',  # Agent name.
             lr=3e-4,  # Learning rate.
             batch_size=1024,  # Batch size.
-            actor_hidden_dims=(1024, 1024, 1024, 1024),  # Actor network hidden dimensions.
-            value_hidden_dims=(1024, 1024, 1024, 1024),  # Value network hidden dimensions.
+            mlp_hidden_dim=256,  # Hidden width for all MLP networks.
+            mlp_num_layers=4,  # Number of layers for all MLP networks.
             layer_norm=True,  # Whether to use layer normalization.
             discount=0.999,  # Discount factor.
             tau=0.005,  # Target network update rate.
@@ -484,8 +505,6 @@ def get_config():
             action_dim=ml_collections.config_dict.placeholder(int),  # Action dimension (set automatically).
             goal_dim=ml_collections.config_dict.placeholder(int),  # Goal dimension (set automatically).
             z_dim=8,  # Latent subgoal dimension.
-            subgoal_encoder_hidden_dim=256,  # Subgoal encoder hidden dimension (ResMLP).
-            subgoal_encoder_num_blocks=2,  # Number of ResMLP blocks in subgoal encoder.
             value_loss_type='bce',  # Value loss type ('squared' or 'bce').
             flow_steps=10,  # Number of flow steps.
             num_samples=32,  # Number of samples for the actor.
@@ -494,13 +513,11 @@ def get_config():
             freeze_encoder=True,  # Whether to freeze encoder weights (if encoder is used).
             high_actor_warmup_steps=0,  # Steps to freeze high actor (0 = no warmup).
             low_actor_goal_conditioned=False,  # Whether low actor sees the final goal in addition to z.
-            encode_goal=False,  # Whether to encode the goal through a ResMLP before passing to low actor.
-            goal_encoder_hidden_dim=256,  # Goal encoder hidden dimension (ResMLP).
-            goal_encoder_num_blocks=2,  # Number of ResMLP blocks in goal encoder.
+            encode_goal=False,  # Whether to encode the goal before passing to low actor.
             goal_encoder_output_dim=64,  # Output dimension of goal encoder.
-            use_resmlp=False,  # Whether to use ResMLP architecture for actors/critics.
-            resmlp_hidden_dim=256,  # Hidden dimension for ResMLP networks (favor depth over width).
-            resmlp_num_blocks=4,  # Number of residual blocks (4 layers each = 17 total layers).
+            use_resmlp=False,  # Whether to use ResMLP architecture for all networks.
+            resmlp_hidden_dim=64,  # Hidden dimension for all ResMLP networks.
+            resmlp_num_blocks=8,  # Number of residual blocks (4 layers each).
             # Dataset hyperparameters.
             dataset_class='HGCDataset',  # Dataset class name.
             subgoal_steps=25,  # Subgoal steps.
