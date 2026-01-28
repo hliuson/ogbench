@@ -14,7 +14,12 @@ from utils.networks import ActorVectorField, GCValue, ResMLPActorVectorField, Re
 
 
 class GCValueWithEncoder(nn.Module):
-    """Goal-conditioned value network with optional state encoder."""
+    """Goal-conditioned value network with optional state encoder.
+
+    Encodes both observations and goals with the same encoder. For critics,
+    also encodes the action/subgoal if it has the same shape as observations
+    (i.e., when subgoals are in observation space).
+    """
 
     encoder: nn.Module
     value: nn.Module
@@ -22,21 +27,36 @@ class GCValueWithEncoder(nn.Module):
     @nn.compact
     def __call__(self, observations, goals, actions=None):
         encoded_obs = self.encoder(observations)
+        encoded_goals = self.encoder(goals)
         if actions is not None:
-            return self.value(encoded_obs, goals, actions)
-        return self.value(encoded_obs, goals)
+            # For critic: actions are subgoals in observation space, encode them too
+            encoded_actions = self.encoder(actions)
+            return self.value(encoded_obs, encoded_goals, encoded_actions)
+        return self.value(encoded_obs, encoded_goals)
 
 
 class ActorVectorFieldWithEncoder(nn.Module):
-    """Actor vector field with optional state encoder."""
+    """Actor vector field with optional state encoder.
+
+    For high actor: predicts subgoals in *encoded* space (not raw observation space).
+    For low actor: observations and subgoals are encoded, actions are in action space.
+    """
 
     encoder: nn.Module
     actor: nn.Module
+    encode_actions: bool = True  # Whether to encode the action/subgoal input
 
     @nn.compact
     def __call__(self, observations, goals, actions, times):
         encoded_obs = self.encoder(observations)
-        return self.actor(encoded_obs, goals, actions, times)
+        encoded_goals = self.encoder(goals)
+        if self.encode_actions:
+            # For high actor training: subgoal targets are observations, encode them
+            encoded_actions = self.encoder(actions)
+            return self.actor(encoded_obs, encoded_goals, encoded_actions, times)
+        else:
+            # For low actor: actions are in action space, don't encode
+            return self.actor(encoded_obs, encoded_goals, actions, times)
 
 
 class SHARSAAgent(flax.struct.PyTreeNode):

@@ -64,7 +64,7 @@ class Dataset(FrozenDict):
 
     def get_random_idxs(self, num_idxs):
         """Return `num_idxs` random indices."""
-        if 'valids' in self._dict:
+        if hasattr(self, 'valid_idxs'):
             return self.valid_idxs[np.random.randint(len(self.valid_idxs), size=num_idxs)]
         else:
             return np.random.randint(self.size, size=num_idxs)
@@ -195,6 +195,14 @@ class GCDataset:
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
 
+        if self.config.get('agent_name') in ('trl', 'trl_value'):
+            cur_idx = 0
+            valid_idxs = []
+            for terminal_idx in self.terminal_locs:
+                valid_idxs.append(np.arange(cur_idx, terminal_idx))
+                cur_idx = terminal_idx + 1
+            self.dataset.valid_idxs = np.concatenate(valid_idxs)
+
         if self.config['frame_stack'] is not None:
             # Only support compact (observation-only) datasets.
             assert 'next_observations' not in self.dataset
@@ -243,9 +251,45 @@ class GCDataset:
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
+        if self.config.get('agent_name') in ('trl', 'trl_value'):
+            final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
+            assert (idxs != final_state_idxs).all()
+            assert (idxs != value_goal_idxs).all()
+
+            value_midpoint_idxs = np.random.randint(idxs, value_goal_idxs)
+
+            batch['value_goal_observations'] = self.get_observations(value_goal_idxs)
+            batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
+            batch['value_offsets'] = value_goal_idxs - idxs
+            batch['value_midpoint_offsets'] = value_midpoint_idxs - idxs
+            batch['value_midpoint_observations'] = self.get_observations(value_midpoint_idxs)
+            batch['value_midpoint_actions'] = self.dataset['actions'][value_midpoint_idxs]
+            batch['next_actions'] = self.dataset['actions'][idxs + 1]
+
+            if 'oracle_reps' in self.dataset:
+                batch['value_midpoint_goals'] = self.dataset['oracle_reps'][value_midpoint_idxs]
+                batch['value_cur_goals'] = self.dataset['oracle_reps'][idxs]
+                batch['value_next_goals'] = self.dataset['oracle_reps'][idxs + 1]
+            else:
+                batch['value_midpoint_goals'] = self.get_observations(value_midpoint_idxs)
+                batch['value_cur_goals'] = self.get_observations(idxs)
+                batch['value_next_goals'] = self.get_observations(idxs + 1)
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
-                self.augment(batch, ['observations', 'next_observations', 'value_goals', 'actor_goals'])
+                aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals']
+                if self.config.get('agent_name') in ('trl', 'trl_value'):
+                    aug_keys.extend(
+                        [
+                            'value_goal_observations',
+                            'actor_goal_observations',
+                            'value_midpoint_observations',
+                            'value_midpoint_goals',
+                            'value_cur_goals',
+                            'value_next_goals',
+                        ]
+                    )
+                self.augment(batch, aug_keys)
 
         return batch
 
