@@ -49,6 +49,46 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             return self.network.select('subgoal_encoder')(midpoint_observations)
         return self.network.select('subgoal_encoder')(midpoint_observations, params=grad_params)
 
+    def _sample_subgoals(self, observations, goals, rng, num_samples=None):
+        """Sample latent subgoals from the high-level policy."""
+        pe_info = self._get_pe_info()
+        if num_samples is None:
+            num_samples = self.config['subgoal_num_samples']
+
+        if self.config['pe_type'] == 'frs':
+            n_observations = jnp.repeat(jnp.expand_dims(observations, 0), num_samples, axis=0)
+            n_goals = jnp.repeat(jnp.expand_dims(goals, 0), num_samples, axis=0)
+
+            z = jax.random.normal(
+                rng,
+                (
+                    num_samples,
+                    *observations.shape[:-1],
+                    self.config['z_dim'],
+                ),
+            )
+            for i in range(self.config['subgoal_flow_steps']):
+                t = jnp.full(
+                    (num_samples, *observations.shape[:-1], 1),
+                    i / self.config['subgoal_flow_steps'],
+                )
+                vels = self.network.select('subgoal_actor')(n_observations, n_goals, z, t)
+                z = z + vels / self.config['subgoal_flow_steps']
+            return z
+
+        dist = self.network.select('subgoal_actor')(observations, goals)
+        return dist.sample(seed=rng, sample_shape=(num_samples,))
+
+    def _expectile_agg(self, samples, tau, num_iters):
+        """Compute expectile over samples with a small fixed-point iteration."""
+        mu = jnp.mean(samples, axis=0)
+
+        def body(_, cur):
+            weights = jnp.where(samples > cur, tau, 1 - tau)
+            return jnp.sum(weights * samples, axis=0) / jnp.sum(weights, axis=0)
+
+        return jax.lax.fori_loop(0, num_iters, body, mu)
+
     @staticmethod
     def bce_loss(pred_logit, target):
         log_pred = jax.nn.log_sigmoid(pred_logit)
@@ -146,8 +186,8 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'q_min': qs.min(),
         }
 
-    def value_loss(self, batch, grad_params):
-        """Compute the value loss using max/expectile over Q(s, z_j, g)."""
+    def value_loss(self, batch, grad_params, rng=None):
+        """Compute the value loss using max/expectile over Q(s, z, g)."""
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
         v_logits = self.network.select('value')(
             batch['observations'],
@@ -156,27 +196,96 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         )
         vs = jax.nn.sigmoid(v_logits)
 
-        z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
-        z_mid = jax.lax.stop_gradient(z_mid)
-        q_logits = self.network.select('target_q')(
-            batch['observations'],
-            goals=batch[goal_key],
-            actions=z_mid,
-        )
-        q = jax.nn.sigmoid(q_logits)
-        if self.config['q_agg'] == 'min':
-            target = jnp.minimum(q[0], q[1])
-        elif self.config['q_agg'] == 'mean':
-            target = q.mean(axis=0)
+        def compute_in_traj_target():
+            z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
+            z_mid = jax.lax.stop_gradient(z_mid)
+            q_logits = self.network.select('target_q')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=z_mid,
+            )
+            q = jax.nn.sigmoid(q_logits)
+            if self.config['q_agg'] == 'min':
+                return jnp.minimum(q[0], q[1])
+            if self.config['q_agg'] == 'mean':
+                return q.mean(axis=0)
+            return q
 
-        expectile_weight = jnp.where(
-            target >= vs,
-            self.config['expectile'],
-            (1 - self.config['expectile']),
-        )
-        dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
-        dist_weight = (1 / (1 + dist)) ** self.config['lam']
-        v_loss = expectile_weight * dist_weight * self.bce_loss(v_logits, target)
+        def compute_generative_target():
+            if rng is None:
+                raise ValueError('rng is required for generative value maximization')
+            goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+            z_samples = self._sample_subgoals(
+                batch['observations'],
+                batch[goal_key],
+                rng,
+                num_samples=self.config['subgoal_num_samples'],
+            )
+            n_observations = jnp.repeat(
+                jnp.expand_dims(batch['observations'], 0),
+                self.config['subgoal_num_samples'],
+                axis=0,
+            )
+            n_goals = jnp.repeat(
+                jnp.expand_dims(batch[goal_key], 0), self.config['subgoal_num_samples'], axis=0
+            )
+            q_logits = self.network.select('target_q')(
+                n_observations,
+                goals=n_goals,
+                actions=z_samples,
+            )
+            q = jax.nn.sigmoid(q_logits)
+            if self.config['q_agg'] == 'min':
+                q = jnp.minimum(q[0], q[1])
+            elif self.config['q_agg'] == 'mean':
+                q = q.mean(axis=0)
+            if self.config['value_maximization_agg'] == 'max':
+                return jnp.max(q, axis=0)
+            if self.config['value_maximization_agg'] == 'expectile':
+                return self._expectile_agg(
+                    q,
+                    self.config['value_sample_expectile'],
+                    self.config['value_sample_expectile_iters'],
+                )
+            return q
+
+        def compute_loss_from_target(target):
+            expectile_weight = jnp.where(
+                target >= vs,
+                self.config['expectile'],
+                (1 - self.config['expectile']),
+            )
+            dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
+            dist_weight = (1 / (1 + dist)) ** self.config['lam']
+            return expectile_weight * dist_weight * self.bce_loss(v_logits, target)
+
+        if self.config['value_maximization'] == 'in-trajectory':
+            v_loss = compute_loss_from_target(compute_in_traj_target())
+        elif self.config['value_maximization'] == 'generative':
+            interval = max(int(self.config['value_maximization_interval']), 1)
+            do_update = (self.network.step % interval) == 0
+            use_fallback = self.config['value_maximization_fallback'] == 'in-trajectory'
+            if use_fallback:
+                traj_loss = compute_loss_from_target(compute_in_traj_target())
+                weight = self.config['value_maximization_weight']
+
+                def gen_branch(_):
+                    gen_loss = compute_loss_from_target(compute_generative_target())
+                    return weight * gen_loss + (1 - weight) * traj_loss
+
+                v_loss = jax.lax.cond(
+                    do_update,
+                    gen_branch,
+                    lambda _: traj_loss,
+                    operand=None,
+                )
+            else:
+                v_loss = jax.lax.cond(
+                    do_update,
+                    lambda _: compute_loss_from_target(compute_generative_target()),
+                    lambda _: jnp.zeros_like(vs),
+                    operand=None,
+                )
 
         total_loss = v_loss.mean()
 
@@ -186,6 +295,106 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'v_mean': vs.mean(),
             'v_max': vs.max(),
             'v_min': vs.min(),
+        }
+
+    def subgoal_actor_loss(self, batch, grad_params, rng):
+        """High-level subgoal proposer loss (flow-matching BC + optional value maximization)."""
+        rng, sample_rng = jax.random.split(rng, 2)
+        z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_target = jax.lax.stop_gradient(z_target)
+
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        if self.config['pe_type'] != 'frs':
+            dist = self.network.select('subgoal_actor')(
+                batch['observations'], batch[goal_key], params=grad_params
+            )
+            bc_loss = -dist.log_prob(z_target).mean()
+        else:
+            batch_size, z_dim = z_target.shape
+            x_rng, t_rng = jax.random.split(rng, 2)
+            x_0 = jax.random.normal(x_rng, (batch_size, z_dim))
+            x_1 = z_target
+            t = jax.random.uniform(t_rng, (batch_size, 1))
+            x_t = (1 - t) * x_0 + t * x_1
+            y = x_1 - x_0
+
+            pred = self.network.select('subgoal_actor')(
+                batch['observations'], batch[goal_key], x_t, t, params=grad_params
+            )
+            bc_loss = jnp.mean((pred - y) ** 2)
+
+        total_loss = self.config['subgoal_actor_bc_coef'] * bc_loss
+
+        if self.config['subgoal_actor_value_coef'] > 0:
+            goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+            z_samples = self._sample_subgoals(
+                batch['observations'],
+                batch[goal_key],
+                sample_rng,
+                num_samples=self.config['subgoal_num_samples'],
+            )
+            n_observations = jnp.repeat(
+                jnp.expand_dims(batch['observations'], 0),
+                self.config['subgoal_num_samples'],
+                axis=0,
+            )
+            n_goals = jnp.repeat(
+                jnp.expand_dims(batch[goal_key], 0),
+                self.config['subgoal_num_samples'],
+                axis=0,
+            )
+            q_logits = self.network.select('target_q')(
+                n_observations,
+                goals=n_goals,
+                actions=z_samples,
+            )
+            q = jax.nn.sigmoid(q_logits)
+            if self.config['q_agg'] == 'min':
+                q = jnp.minimum(q[0], q[1])
+            elif self.config['q_agg'] == 'mean':
+                q = q.mean(axis=0)
+            if self.config['value_maximization_agg'] == 'max':
+                q_best = jnp.max(q, axis=0)
+            elif self.config['value_maximization_agg'] == 'expectile':
+                q_best = self._expectile_agg(
+                    q,
+                    self.config['value_sample_expectile'],
+                    self.config['value_sample_expectile_iters'],
+                )
+            value_loss = -q_best.mean()
+            total_loss = total_loss + self.config['subgoal_actor_value_coef'] * value_loss
+
+        return total_loss, {
+            'actor_loss': total_loss,
+            'bc_loss': bc_loss,
+        }
+
+    def low_actor_loss(self, batch, grad_params, rng):
+        """Low-level actor loss conditioned on latent subgoals."""
+        z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_target = jax.lax.stop_gradient(z_target)
+
+        if self.config['pe_type'] == 'frs':
+            batch_size, action_dim = batch['actions'].shape
+            x_rng, t_rng = jax.random.split(rng, 2)
+            x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
+            x_1 = batch['actions']
+            t = jax.random.uniform(t_rng, (batch_size, 1))
+            x_t = (1 - t) * x_0 + t * x_1
+            y = x_1 - x_0
+
+            pred = self.network.select('low_actor')(
+                batch['observations'], z_target, x_t, t, params=grad_params
+            )
+            bc_loss = jnp.mean((pred - y) ** 2)
+        else:
+            dist = self.network.select('low_actor')(batch['observations'], z_target, params=grad_params)
+            bc_loss = -dist.log_prob(batch['actions']).mean()
+
+        total_loss = self.config['low_actor_bc_coef'] * bc_loss
+        return total_loss, {
+            'actor_loss': total_loss,
+            'bc_loss': bc_loss,
         }
 
     def actor_loss(self, batch, grad_params, rng=None):
@@ -287,7 +496,9 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         info = {}
         rng = rng if rng is not None else self.rng
 
-        value_loss, value_info = self.value_loss(batch, grad_params)
+        rng, value_rng, actor_rng, subgoal_actor_rng, low_actor_rng = jax.random.split(rng, 5)
+
+        value_loss, value_info = self.value_loss(batch, grad_params, rng=value_rng)
         for k, v in value_info.items():
             info[f'value/{k}'] = v
 
@@ -299,12 +510,19 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         for k, v in q_short_info.items():
             info[f'q_short/{k}'] = v
 
-        rng, actor_rng = jax.random.split(rng)
         actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = value_loss + q_loss + q_short_loss + actor_loss
+        subgoal_actor_loss, subgoal_actor_info = self.subgoal_actor_loss(batch, grad_params, subgoal_actor_rng)
+        for k, v in subgoal_actor_info.items():
+            info[f'subgoal_actor/{k}'] = v
+
+        low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
+        for k, v in low_actor_info.items():
+            info[f'low_actor/{k}'] = v
+
+        loss = value_loss + q_loss + q_short_loss + actor_loss + subgoal_actor_loss + low_actor_loss
         return loss, info
 
     def target_update(self, network, module_name):
@@ -337,6 +555,33 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         temperature=1.0,
     ):
         pe_info = self._get_pe_info()
+
+        if self.config['use_high_policy_inference']:
+            high_seed, low_seed = jax.random.split(seed)
+            z = self._sample_subgoals(
+                observations,
+                goals,
+                high_seed,
+                num_samples=self.config['subgoal_num_samples'],
+            )
+            if len(observations.shape) == 2:
+                z = z[0, jnp.arange(observations.shape[0])]
+            else:
+                z = z[0]
+
+            if self.config['pe_type'] == 'frs':
+                actions = jax.random.normal(low_seed, (*observations.shape[:-1], self.config['action_dim']))
+                for i in range(pe_info['flow_steps']):
+                    t = jnp.full((*observations.shape[:-1], 1), i / pe_info['flow_steps'])
+                    vels = self.network.select('low_actor')(observations, z, actions, t)
+                    actions = actions + vels / pe_info['flow_steps']
+                actions = jnp.clip(actions, -1, 1)
+            else:
+                dist = self.network.select('low_actor')(observations, z, temperature=temperature)
+                actions = dist.sample(seed=low_seed)
+                if self.config['pe_type'] != 'discrete':
+                    actions = jnp.clip(actions, -1, 1)
+            return actions
 
         if self.config['pe_type'] == 'frs':
             n_observations = jnp.repeat(jnp.expand_dims(observations, 0), pe_info['num_samples'], axis=0)
@@ -393,6 +638,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         ex_actions = example_batch['actions']
         ex_goals = example_batch['actor_goals']
         ex_mid_obs = example_batch.get('value_midpoint_observations', ex_observations)
+        ex_value_goals = ex_observations if config['oracle_distill'] else ex_goals
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
         pe_info = cls._get_pe_info_from_config(config)
@@ -428,6 +674,18 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions, ex_times)
+            subgoal_actor_def = ActorVectorField(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=config['z_dim'],
+                layer_norm=config['layer_norm'],
+            )
+            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z, ex_times)
+            low_actor_def = ActorVectorField(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                layer_norm=config['layer_norm'],
+            )
+            ex_low_actor_in = (ex_observations, ex_z, ex_actions, ex_times)
         elif config['pe_type'] == 'discrete':
             actor_def = GCDiscreteActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -435,6 +693,20 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
+            subgoal_actor_def = GCActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=config['z_dim'],
+                layer_norm=config['layer_norm'],
+                state_dependent_std=False,
+                const_std=pe_info['const_std'],
+            )
+            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
+            low_actor_def = GCDiscreteActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=config['pe_discrete']['action_ct'],
+                layer_norm=config['layer_norm'],
+            )
+            ex_low_actor_in = (ex_observations, ex_z, ex_actions)
         else:
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -444,8 +716,23 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 const_std=pe_info['const_std'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
+            subgoal_actor_def = GCActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=config['z_dim'],
+                layer_norm=config['layer_norm'],
+                state_dependent_std=False,
+                const_std=pe_info['const_std'],
+            )
+            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
+            low_actor_def = GCActor(
+                hidden_dims=config['actor_hidden_dims'],
+                action_dim=action_dim,
+                layer_norm=config['layer_norm'],
+                state_dependent_std=False,
+                const_std=pe_info['const_std'],
+            )
+            ex_low_actor_in = (ex_observations, ex_z, ex_actions)
 
-        ex_value_goals = ex_observations if config['oracle_distill'] else ex_goals
         ex_q_short_goals = ex_goals
         # No actions in value function inputs
         network_info = dict(
@@ -456,6 +743,8 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             target_q=(copy.deepcopy(q_def), (ex_observations, ex_value_goals, ex_z)),
             q_short=(q_short_def, (ex_observations, ex_q_short_goals, ex_actions)),  # Q_short takes actions
             actor=(actor_def, ex_actor_in),
+            subgoal_actor=(subgoal_actor_def, ex_subgoal_actor_in),
+            low_actor=(low_actor_def, ex_low_actor_in),
         )
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
@@ -490,6 +779,19 @@ def get_config():
             oracle_distill=False,
             q_agg='min',
             z_dim=8,
+            value_maximization='in-trajectory',  # in-trajectory or generative
+            value_maximization_agg='max',  # max or expectile
+            value_maximization_interval=1,
+            value_maximization_fallback='none',  # none or in-trajectory
+            value_maximization_weight=1.0,
+            value_sample_expectile=0.7,
+            value_sample_expectile_iters=5,
+            subgoal_num_samples=32,
+            subgoal_flow_steps=10,
+            subgoal_actor_bc_coef=1.0,
+            subgoal_actor_value_coef=0.0,
+            low_actor_bc_coef=1.0,
+            use_high_policy_inference=False,
             pe_type='frs',  # frs (flow rejection sampling), rpg (reparameterized grads), discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),
