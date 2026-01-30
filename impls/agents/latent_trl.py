@@ -1,7 +1,8 @@
 import copy
-from typing import Any
+from typing import Any, Sequence
 
 import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import ml_collections
@@ -12,11 +13,23 @@ from utils.networks import (
     GCActor,
     GCDiscreteActor,
     GCValue,
+    MLP,
 )
 
+class SubgoalEncoder(nn.Module):
+    """Subgoal encoder: s_j -> z_j."""
 
-class TRLValueAgent(flax.struct.PyTreeNode):
-    """TRL agent with action-free value function V(s, g) instead of Q(s, g, a)."""
+    hidden_dims: Sequence[int]
+    layer_norm: bool
+    z_dim: int
+
+    @nn.compact
+    def __call__(self, x):
+        return MLP((*self.hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
+
+
+class LatentTRLAgent(flax.struct.PyTreeNode):
+    """Latent TRL agent with action-free V(s, g) and latent subgoal Q(s, z, g)."""
 
     rng: Any
     network: Any
@@ -31,6 +44,11 @@ class TRLValueAgent(flax.struct.PyTreeNode):
     def _get_pe_info(self):
         return self._get_pe_info_from_config(self.config)
 
+    def _encode_subgoal(self, midpoint_observations, grad_params=None):
+        if grad_params is None:
+            return self.network.select('subgoal_encoder')(midpoint_observations)
+        return self.network.select('subgoal_encoder')(midpoint_observations, params=grad_params)
+
     @staticmethod
     def bce_loss(pred_logit, target):
         log_pred = jax.nn.log_sigmoid(pred_logit)
@@ -44,12 +62,15 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         Q_short approximates the 1-step Q value: Q(s, g, a) ≈ γ * V(s', g)
         This allows rejection sampling at inference without a dynamics model.
         """
-        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        # For oracle distill, use oracle goals for q_short, but no oracle teacher for value/Q.
+        q_short_goal_key = 'value_goals'
+        target_goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        target_value_module = 'target_value'
 
         # Target: γ * V(s', g) from the target value network
-        v_next_logits = self.network.select('target_value')(
+        v_next_logits = self.network.select(target_value_module)(
             batch['next_observations'],
-            goals=batch[goal_key],
+            goals=batch[target_goal_key],
         )
         v_next = jax.nn.sigmoid(v_next_logits)
         # Take min over ensembles for conservative target
@@ -59,7 +80,7 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         # Predict Q_short(s, g, a)
         q_short_logits = self.network.select('q_short')(
             batch['observations'],
-            goals=batch[goal_key],
+            goals=batch[q_short_goal_key],
             actions=batch['actions'],
             params=grad_params,
         )
@@ -76,17 +97,20 @@ class TRLValueAgent(flax.struct.PyTreeNode):
             'v_next_target_mean': target.mean(),
         }
 
-    def value_loss(self, batch, grad_params):
-        """Compute the value loss using triangle inequality with V(s, g)."""
+    def q_loss(self, batch, grad_params):
+        """Compute Q(s, z_j, g) loss as BCE to the triangle inequality target."""
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
-        v_logits = self.network.select('value')(
+        midpoint_goal_key = 'value_midpoint_observations' if self.config['oracle_distill'] else 'value_midpoint_goals'
+
+        z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params=grad_params)
+        q_logits = self.network.select('q')(
             batch['observations'],
             goals=batch[goal_key],
+            actions=z_mid,
             params=grad_params,
         )
-        vs = jax.nn.sigmoid(v_logits)
+        qs = jax.nn.sigmoid(q_logits)
 
-        midpoint_goal_key = 'value_midpoint_observations' if self.config['oracle_distill'] else 'value_midpoint_goals'
         first_v_logits = self.network.select('target_value')(
             batch['observations'],
             goals=batch[midpoint_goal_key],
@@ -109,6 +133,42 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         )
         target = first_v * second_v
 
+        dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
+        dist_weight = (1 / (1 + dist)) ** self.config['lam']
+        q_loss = dist_weight * self.bce_loss(q_logits, jax.lax.stop_gradient(target))
+        total_loss = q_loss.mean()
+
+        return total_loss, {
+            'total_loss': total_loss,
+            'q_loss': q_loss,
+            'q_mean': qs.mean(),
+            'q_max': qs.max(),
+            'q_min': qs.min(),
+        }
+
+    def value_loss(self, batch, grad_params):
+        """Compute the value loss using max/expectile over Q(s, z_j, g)."""
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        v_logits = self.network.select('value')(
+            batch['observations'],
+            goals=batch[goal_key],
+            params=grad_params,
+        )
+        vs = jax.nn.sigmoid(v_logits)
+
+        z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_mid = jax.lax.stop_gradient(z_mid)
+        q_logits = self.network.select('target_q')(
+            batch['observations'],
+            goals=batch[goal_key],
+            actions=z_mid,
+        )
+        q = jax.nn.sigmoid(q_logits)
+        if self.config['q_agg'] == 'min':
+            target = jnp.minimum(q[0], q[1])
+        elif self.config['q_agg'] == 'mean':
+            target = q.mean(axis=0)
+
         expectile_weight = jnp.where(
             target >= vs,
             self.config['expectile'],
@@ -119,16 +179,6 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         v_loss = expectile_weight * dist_weight * self.bce_loss(v_logits, target)
 
         total_loss = v_loss.mean()
-
-        if self.config['oracle_distill']:
-            distill_v_logits = self.network.select('oracle_value')(
-                batch['observations'],
-                goals=batch['value_goals'],
-                params=grad_params,
-            )
-            distill_loss = self.bce_loss(distill_v_logits, jax.lax.stop_gradient(vs)).mean()
-
-            total_loss = total_loss + distill_loss
 
         return total_loss, {
             'total_loss': total_loss,
@@ -153,12 +203,12 @@ class TRLValueAgent(flax.struct.PyTreeNode):
 
             # Use V(s', g) where s' is approximated by next_observations
             # For advantage: A = V(s', g) - V(s, g)
-            value_module = 'oracle_value' if self.config['oracle_distill'] else 'value'
-            v_next = self.network.select(value_module)(
-                batch['next_observations'], batch['actor_goals']
+            actor_goal_key = 'actor_goal_observations' if self.config['oracle_distill'] else 'actor_goals'
+            v_next = self.network.select('value')(
+                batch['next_observations'], batch[actor_goal_key]
             )
-            v_curr = self.network.select(value_module)(
-                batch['observations'], batch['actor_goals']
+            v_curr = self.network.select('value')(
+                batch['observations'], batch[actor_goal_key]
             )
             # Take min over ensembles
             v = jnp.minimum(v_next[0], v_next[1])
@@ -189,9 +239,9 @@ class TRLValueAgent(flax.struct.PyTreeNode):
 
             # For discrete: compute V for each possible next state
             # Since we don't have dynamics, use V(s', g) from data
-            value_module = 'oracle_value' if self.config['oracle_distill'] else 'value'
-            v = self.network.select(value_module)(
-                batch['next_observations'], batch['actor_goals']
+            actor_goal_key = 'actor_goal_observations' if self.config['oracle_distill'] else 'actor_goals'
+            v = self.network.select('value')(
+                batch['next_observations'], batch[actor_goal_key]
             ).mean(axis=0)  # Average over ensembles
 
             v_loss = -v.mean()
@@ -241,6 +291,10 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         for k, v in value_info.items():
             info[f'value/{k}'] = v
 
+        q_loss, q_info = self.q_loss(batch, grad_params)
+        for k, v in q_info.items():
+            info[f'q/{k}'] = v
+
         q_short_loss, q_short_info = self.q_short_loss(batch, grad_params)
         for k, v in q_short_info.items():
             info[f'q_short/{k}'] = v
@@ -250,7 +304,7 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = value_loss + q_short_loss + actor_loss
+        loss = value_loss + q_loss + q_short_loss + actor_loss
         return loss, info
 
     def target_update(self, network, module_name):
@@ -270,6 +324,7 @@ class TRLValueAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'value')
+        self.target_update(new_network, 'q')
 
         return self.replace(network=new_network, rng=new_rng), info
 
@@ -337,9 +392,11 @@ class TRLValueAgent(flax.struct.PyTreeNode):
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_goals = example_batch['actor_goals']
+        ex_mid_obs = example_batch.get('value_midpoint_observations', ex_observations)
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
         pe_info = cls._get_pe_info_from_config(config)
+        ex_z = jnp.zeros((ex_observations.shape[0], config['z_dim']), dtype=ex_observations.dtype)
 
         # Action-free value function V(s, g)
         value_def = GCValue(
@@ -347,10 +404,15 @@ class TRLValueAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
-        oracle_value_def = GCValue(
+        q_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=2,
+        )
+        subgoal_encoder_def = SubgoalEncoder(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            z_dim=config['z_dim'],
         )
         # Short-horizon Q distilled from V(s', g) for rejection sampling
         q_short_def = GCValue(
@@ -384,12 +446,15 @@ class TRLValueAgent(flax.struct.PyTreeNode):
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
 
         ex_value_goals = ex_observations if config['oracle_distill'] else ex_goals
+        ex_q_short_goals = ex_goals
         # No actions in value function inputs
         network_info = dict(
+            subgoal_encoder=(subgoal_encoder_def, (ex_mid_obs,)),
             value=(value_def, (ex_observations, ex_value_goals)),
             target_value=(copy.deepcopy(value_def), (ex_observations, ex_value_goals)),
-            oracle_value=(oracle_value_def, (ex_observations, ex_goals)),
-            q_short=(q_short_def, (ex_observations, ex_value_goals, ex_actions)),  # Q_short takes actions
+            q=(q_def, (ex_observations, ex_value_goals, ex_z)),
+            target_q=(copy.deepcopy(q_def), (ex_observations, ex_value_goals, ex_z)),
+            q_short=(q_short_def, (ex_observations, ex_q_short_goals, ex_actions)),  # Q_short takes actions
             actor=(actor_def, ex_actor_in),
         )
         networks = {k: v[0] for k, v in network_info.items()}
@@ -403,6 +468,7 @@ class TRLValueAgent(flax.struct.PyTreeNode):
 
         params = network_params
         params['modules_target_value'] = params['modules_value']
+        params['modules_target_q'] = params['modules_q']
 
         config['action_dim'] = action_dim
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
@@ -411,7 +477,7 @@ class TRLValueAgent(flax.struct.PyTreeNode):
 def get_config():
     config = ml_collections.ConfigDict(
         dict(
-            agent_name='trl_value',
+            agent_name='latent_trl',
             lr=3e-4,
             batch_size=1024,
             actor_hidden_dims=(1024,) * 4,
@@ -422,6 +488,8 @@ def get_config():
             lam=0.0,
             expectile=0.7,
             oracle_distill=False,
+            q_agg='min',
+            z_dim=8,
             pe_type='frs',  # frs (flow rejection sampling), rpg (reparameterized grads), discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

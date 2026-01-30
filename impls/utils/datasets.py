@@ -195,7 +195,7 @@ class GCDataset:
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
 
-        if self.config.get('agent_name') in ('trl', 'trl_value'):
+        if self.config.get('agent_name') in ('trl', 'latent_trl'):
             cur_idx = 0
             valid_idxs = []
             for terminal_idx in self.terminal_locs:
@@ -251,7 +251,7 @@ class GCDataset:
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
-        if self.config.get('agent_name') in ('trl', 'trl_value'):
+        if self.config.get('agent_name') in ('trl', 'latent_trl'):
             final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
             assert (idxs != final_state_idxs).all()
             assert (idxs != value_goal_idxs).all()
@@ -278,7 +278,7 @@ class GCDataset:
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals']
-                if self.config.get('agent_name') in ('trl', 'trl_value'):
+                if self.config.get('agent_name') in ('trl', 'latent_trl'):
                     aug_keys.extend(
                         [
                             'value_goal_observations',
