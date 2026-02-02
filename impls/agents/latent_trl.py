@@ -393,16 +393,43 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'bc_loss': bc_loss,
         }
 
+    def _low_actor_goal_conditioning(self):
+        if 'low_actor_goal_conditioning' in self.config:
+            return self.config['low_actor_goal_conditioning']
+        return None
+
+    def _use_high_policy_inference(self):
+        if 'low_actor_goal_conditioning' in self.config:
+            return self.config['low_actor_goal_conditioning'] in ('latent', 'both')
+        return self.config['use_high_policy_inference']
+
     def _low_actor_goals(self, z, goals, true_goals=None):
-        """Build low actor goal input: z, [z; goal], [z; true_goal], or [z; goal; true_goal]."""
-        parts = [z]
-        if self.config['low_actor_goal_conditioned']:
-            parts.append(goals)
-        if self.config['low_actor_true_goal_conditioned'] and true_goals is not None:
-            parts.append(true_goals)
-        if len(parts) == 1:
+        """Build low actor goal input based on conditioning mode."""
+        conditioning = self._low_actor_goal_conditioning()
+        if conditioning is None:
+            # Backward compatibility with boolean flags.
+            parts = [z]
+            if self.config.get('low_actor_goal_conditioned', False):
+                parts.append(goals)
+            if self.config.get('low_actor_true_goal_conditioned', False) and true_goals is not None:
+                parts.append(true_goals)
+            if len(parts) == 1:
+                return z
+            return jnp.concatenate(parts, axis=-1)
+        if conditioning == 'latent':
             return z
-        return jnp.concatenate(parts, axis=-1)
+        if conditioning == 'actual':
+            if true_goals is not None:
+                return true_goals
+            if goals is not None:
+                return goals
+            return z
+        # both: concatenate latent z with true goals when available, otherwise with goals.
+        if true_goals is not None:
+            return jnp.concatenate([z, true_goals], axis=-1)
+        if goals is not None:
+            return jnp.concatenate([z, goals], axis=-1)
+        return z
 
     def low_actor_loss(self, batch, grad_params, rng):
         """Low-level actor loss conditioned on latent subgoals."""
@@ -438,9 +465,43 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss."""
         pe_info = self._get_pe_info()
+        conditioning = self._low_actor_goal_conditioning()
+
+        if conditioning is not None:
+            rng = rng if rng is not None else self.rng
+            rng, flow_rng = jax.random.split(rng, 2)
+            z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+            z_target = jax.lax.stop_gradient(z_target)
+            goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+            z_goals = self._low_actor_goals(z_target, batch[goal_key], batch.get('actor_goals'))
+
+            if self.config['pe_type'] == 'frs':
+                batch_size, action_dim = batch['actions'].shape
+                x_rng, t_rng = jax.random.split(flow_rng, 2)
+                x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
+                x_1 = batch['actions']
+                t = jax.random.uniform(t_rng, (batch_size, 1))
+                x_t = (1 - t) * x_0 + t * x_1
+                y = x_1 - x_0
+
+                pred = self.network.select('low_actor')(
+                    batch['observations'], z_goals, x_t, t, params=grad_params
+                )
+                bc_loss = jnp.mean((pred - y) ** 2)
+            else:
+                dist = self.network.select('low_actor')(batch['observations'], z_goals, params=grad_params)
+                bc_loss = -dist.log_prob(batch['actions']).mean()
+
+            actor_loss = self.config['low_actor_bc_coef'] * bc_loss
+            return actor_loss, {
+                'actor_loss': actor_loss,
+                'bc_loss': bc_loss,
+            }
+
+        actor_module = 'low_actor' if conditioning == 'actual' else 'actor'
 
         if self.config['pe_type'] == 'rpg':
-            dist = self.network.select('actor')(
+            dist = self.network.select(actor_module)(
                 batch['observations'], batch['actor_goals'], params=grad_params
             )
             if pe_info['const_std']:
@@ -480,7 +541,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             }
 
         elif self.config['pe_type'] == 'discrete':
-            dist = self.network.select('actor')(
+            dist = self.network.select(actor_module)(
                 batch['observations'], batch['actor_goals'], params=grad_params
             )
 
@@ -517,7 +578,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             x_t = (1 - t) * x_0 + t * x_1
             y = x_1 - x_0
 
-            pred = self.network.select('actor')(
+            pred = self.network.select(actor_module)(
                 batch['observations'], batch['actor_goals'], x_t, t, params=grad_params
             )
 
@@ -556,9 +617,12 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         for k, v in subgoal_actor_info.items():
             info[f'subgoal_actor/{k}'] = v
 
-        low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
-        for k, v in low_actor_info.items():
-            info[f'low_actor/{k}'] = v
+        if self._low_actor_goal_conditioning() is not None:
+            low_actor_loss = jnp.zeros(())
+        else:
+            low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
+            for k, v in low_actor_info.items():
+                info[f'low_actor/{k}'] = v
 
         loss = value_loss + q_loss + q_short_loss + actor_loss + subgoal_actor_loss + low_actor_loss
         return loss, info
@@ -594,7 +658,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
     ):
         pe_info = self._get_pe_info()
 
-        if self.config['use_high_policy_inference']:
+        if self._use_high_policy_inference():
             high_seed, low_seed = jax.random.split(seed)
             z = self._sample_subgoals(
                 observations,
@@ -656,7 +720,8 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             return actions
 
         else:
-            dist = self.network.select('actor')(observations, goals, temperature=temperature)
+            actor_module = 'low_actor' if self._low_actor_goal_conditioning() == 'actual' else 'actor'
+            dist = self.network.select(actor_module)(observations, goals, temperature=temperature)
             actions = dist.sample(seed=seed)
 
             if self.config['pe_type'] != 'discrete':
@@ -684,13 +749,26 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         pe_info = cls._get_pe_info_from_config(config)
         ex_z = jnp.zeros((ex_observations.shape[0], config['z_dim']), dtype=ex_observations.dtype)
 
-        # Build example low actor goal input: z, [z; value_goal], [z; true_goal], or [z; value_goal; true_goal]
-        ex_low_actor_goal_parts = [ex_z]
-        if config['low_actor_goal_conditioned']:
-            ex_low_actor_goal_parts.append(ex_value_goals)
-        if config['low_actor_true_goal_conditioned']:
-            ex_low_actor_goal_parts.append(ex_goals)
-        ex_low_actor_z = jnp.concatenate(ex_low_actor_goal_parts, axis=-1) if len(ex_low_actor_goal_parts) > 1 else ex_z
+        # Build example low actor goal input based on conditioning.
+        conditioning = config.get('low_actor_goal_conditioning')
+        if conditioning is None:
+            # Backward compatibility with boolean flags.
+            ex_low_actor_goal_parts = [ex_z]
+            if config.get('low_actor_goal_conditioned', False):
+                ex_low_actor_goal_parts.append(ex_value_goals)
+            if config.get('low_actor_true_goal_conditioned', False):
+                ex_low_actor_goal_parts.append(ex_goals)
+            ex_low_actor_z = (
+                jnp.concatenate(ex_low_actor_goal_parts, axis=-1)
+                if len(ex_low_actor_goal_parts) > 1
+                else ex_z
+            )
+        elif conditioning == 'latent':
+            ex_low_actor_z = ex_z
+        elif conditioning == 'actual':
+            ex_low_actor_z = ex_goals
+        else:
+            ex_low_actor_z = jnp.concatenate([ex_z, ex_goals], axis=-1)
 
         # Action-free value function V(s, g)
         value_def = GCValue(
@@ -841,9 +919,10 @@ def get_config():
             subgoal_actor_bc_coef=1.0,
             subgoal_actor_value_coef=0.0,
             low_actor_bc_coef=1.0,
-            low_actor_goal_conditioned=False,  # Whether low actor sees the subgoal goal (value goal) in addition to z.
-            low_actor_true_goal_conditioned=False,  # Whether low actor sees the true task goal in addition to z.
-            use_high_policy_inference=False,
+            low_actor_goal_conditioning='actual',  # 'actual', 'latent', or 'both'
+            low_actor_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.
+            low_actor_true_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.
+            use_high_policy_inference=False,  # Ignored when low_actor_goal_conditioning is set.
             pe_type='frs',  # frs (flow rejection sampling), rpg (reparameterized grads), discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),
