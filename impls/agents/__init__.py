@@ -8,6 +8,7 @@ from agents.sac import SACAgent
 from agents.sharsa import SHARSAAgent
 from agents.trl import TRLAgent
 from agents.latent_trl import LatentTRLAgent
+from agents.discrete_latent_trl import DiscreteLatentTRLAgent
 from agents.discrete_latent_sharsa import DiscreteLatentSHARSAAgent
 from agents.latent_sharsa import LatentSHARSAAgent
 
@@ -22,6 +23,7 @@ agents = dict(
     sharsa=SHARSAAgent,
     trl=TRLAgent,
     latent_trl=LatentTRLAgent,
+    discrete_latent_trl=DiscreteLatentTRLAgent,
     discrete_latent_sharsa=DiscreteLatentSHARSAAgent,
     latent_sharsa=LatentSHARSAAgent,
 )
