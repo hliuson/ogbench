@@ -180,7 +180,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         return total_loss, {
             'total_loss': total_loss,
-            'q_loss': q_loss,
+            'q_loss': q_loss.mean(),
             'q_mean': qs.mean(),
             'q_max': qs.max(),
             'q_min': qs.min(),
@@ -211,7 +211,8 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 return q.mean(axis=0)
             return q
 
-        def compute_generative_target():
+        def compute_generative_q_samples():
+            """Return per-sample Q values (shape [N, batch]) and the aggregated target."""
             if rng is None:
                 raise ValueError('rng is required for generative value maximization')
             goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
@@ -239,15 +240,22 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 q = jnp.minimum(q[0], q[1])
             elif self.config['q_agg'] == 'mean':
                 q = q.mean(axis=0)
+            # q shape: [N, batch]
             if self.config['value_maximization_agg'] == 'max':
-                return jnp.max(q, axis=0)
-            if self.config['value_maximization_agg'] == 'expectile':
-                return self._expectile_agg(
+                target = jnp.max(q, axis=0)
+            elif self.config['value_maximization_agg'] == 'expectile':
+                target = self._expectile_agg(
                     q,
                     self.config['value_sample_expectile'],
                     self.config['value_sample_expectile_iters'],
                 )
-            return q
+            else:
+                target = q
+            return q, target
+
+        def compute_generative_target():
+            _, target = compute_generative_q_samples()
+            return target
 
         def compute_loss_from_target(target):
             expectile_weight = jnp.where(
@@ -259,30 +267,45 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             dist_weight = (1 / (1 + dist)) ** self.config['lam']
             return expectile_weight * dist_weight * self.bce_loss(v_logits, target)
 
+        info = {}
+
         if self.config['value_maximization'] == 'in-trajectory':
             v_loss = compute_loss_from_target(compute_in_traj_target())
         elif self.config['value_maximization'] == 'generative':
             interval = max(int(self.config['value_maximization_interval']), 1)
             do_update = (self.network.step % interval) == 0
-            use_fallback = self.config['value_maximization_fallback'] == 'in-trajectory'
-            if use_fallback:
+            ramp_steps = int(self.config.get('value_maximization_ramp_steps', 0))
+
+            # Compute generative target and log Q sample diagnostics.
+            q_samples, gen_target = compute_generative_q_samples()
+            # q_samples shape: [N, batch]. Reduce to scalars for logging.
+            info['gen_q_mean'] = jnp.mean(q_samples)
+            info['gen_q_std'] = jnp.mean(jnp.std(q_samples, axis=0))
+            info['gen_q_min'] = jnp.mean(jnp.min(q_samples, axis=0))
+            info['gen_q_max'] = jnp.mean(jnp.max(q_samples, axis=0))
+            info['gen_target_mean'] = jnp.mean(gen_target)
+
+            gen_loss = compute_loss_from_target(gen_target)
+
+            if ramp_steps > 0:
+                # Linear interpolation from in-trajectory to generative.
+                alpha = jnp.clip(self.network.step / ramp_steps, 0.0, 1.0)
+                traj_loss = compute_loss_from_target(compute_in_traj_target())
+                v_loss = (1 - alpha) * traj_loss + alpha * gen_loss
+                info['ramp_alpha'] = alpha
+            elif self.config['value_maximization_fallback'] == 'in-trajectory':
                 traj_loss = compute_loss_from_target(compute_in_traj_target())
                 weight = self.config['value_maximization_weight']
-
-                def gen_branch(_):
-                    gen_loss = compute_loss_from_target(compute_generative_target())
-                    return weight * gen_loss + (1 - weight) * traj_loss
-
                 v_loss = jax.lax.cond(
                     do_update,
-                    gen_branch,
+                    lambda _: weight * gen_loss + (1 - weight) * traj_loss,
                     lambda _: traj_loss,
                     operand=None,
                 )
             else:
                 v_loss = jax.lax.cond(
                     do_update,
-                    lambda _: compute_loss_from_target(compute_generative_target()),
+                    lambda _: gen_loss,
                     lambda _: jnp.zeros_like(vs),
                     operand=None,
                 )
@@ -291,10 +314,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         return total_loss, {
             'total_loss': total_loss,
-            'v_loss': v_loss,
+            'v_loss': v_loss.mean(),
             'v_mean': vs.mean(),
             'v_max': vs.max(),
             'v_min': vs.min(),
+            **info,
         }
 
     def subgoal_actor_loss(self, batch, grad_params, rng):
@@ -369,10 +393,24 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'bc_loss': bc_loss,
         }
 
+    def _low_actor_goals(self, z, goals, true_goals=None):
+        """Build low actor goal input: z, [z; goal], [z; true_goal], or [z; goal; true_goal]."""
+        parts = [z]
+        if self.config['low_actor_goal_conditioned']:
+            parts.append(goals)
+        if self.config['low_actor_true_goal_conditioned'] and true_goals is not None:
+            parts.append(true_goals)
+        if len(parts) == 1:
+            return z
+        return jnp.concatenate(parts, axis=-1)
+
     def low_actor_loss(self, batch, grad_params, rng):
         """Low-level actor loss conditioned on latent subgoals."""
         z_target = self._encode_subgoal(batch['value_midpoint_observations'])
         z_target = jax.lax.stop_gradient(z_target)
+
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        z_goals = self._low_actor_goals(z_target, batch[goal_key], batch.get('actor_goals'))
 
         if self.config['pe_type'] == 'frs':
             batch_size, action_dim = batch['actions'].shape
@@ -384,11 +422,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             y = x_1 - x_0
 
             pred = self.network.select('low_actor')(
-                batch['observations'], z_target, x_t, t, params=grad_params
+                batch['observations'], z_goals, x_t, t, params=grad_params
             )
             bc_loss = jnp.mean((pred - y) ** 2)
         else:
-            dist = self.network.select('low_actor')(batch['observations'], z_target, params=grad_params)
+            dist = self.network.select('low_actor')(batch['observations'], z_goals, params=grad_params)
             bc_loss = -dist.log_prob(batch['actions']).mean()
 
         total_loss = self.config['low_actor_bc_coef'] * bc_loss
@@ -432,7 +470,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
             return actor_loss, {
                 'actor_loss': actor_loss,
-                'v_loss': v_loss,
+                'v_loss': v_loss.mean(),
                 'bc_loss': bc_loss,
                 'v_mean': v.mean(),
                 'v_abs_mean': jnp.abs(v).mean(),
@@ -462,7 +500,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
             return actor_loss, {
                 'actor_loss': actor_loss,
-                'v_loss': v_loss,
+                'v_loss': v_loss.mean(),
                 'bc_loss': bc_loss,
                 'v_mean': v.mean(),
                 'v_abs_mean': jnp.abs(v).mean(),
@@ -569,15 +607,17 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             else:
                 z = z[0]
 
+            z_goals = self._low_actor_goals(z, goals, goals)
+
             if self.config['pe_type'] == 'frs':
                 actions = jax.random.normal(low_seed, (*observations.shape[:-1], self.config['action_dim']))
                 for i in range(pe_info['flow_steps']):
                     t = jnp.full((*observations.shape[:-1], 1), i / pe_info['flow_steps'])
-                    vels = self.network.select('low_actor')(observations, z, actions, t)
+                    vels = self.network.select('low_actor')(observations, z_goals, actions, t)
                     actions = actions + vels / pe_info['flow_steps']
                 actions = jnp.clip(actions, -1, 1)
             else:
-                dist = self.network.select('low_actor')(observations, z, temperature=temperature)
+                dist = self.network.select('low_actor')(observations, z_goals, temperature=temperature)
                 actions = dist.sample(seed=low_seed)
                 if self.config['pe_type'] != 'discrete':
                     actions = jnp.clip(actions, -1, 1)
@@ -644,6 +684,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         pe_info = cls._get_pe_info_from_config(config)
         ex_z = jnp.zeros((ex_observations.shape[0], config['z_dim']), dtype=ex_observations.dtype)
 
+        # Build example low actor goal input: z, [z; value_goal], [z; true_goal], or [z; value_goal; true_goal]
+        ex_low_actor_goal_parts = [ex_z]
+        if config['low_actor_goal_conditioned']:
+            ex_low_actor_goal_parts.append(ex_value_goals)
+        if config['low_actor_true_goal_conditioned']:
+            ex_low_actor_goal_parts.append(ex_goals)
+        ex_low_actor_z = jnp.concatenate(ex_low_actor_goal_parts, axis=-1) if len(ex_low_actor_goal_parts) > 1 else ex_z
+
         # Action-free value function V(s, g)
         value_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
@@ -675,17 +723,17 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions, ex_times)
             subgoal_actor_def = ActorVectorField(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=config['z_dim'],
                 layer_norm=config['layer_norm'],
             )
             ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z, ex_times)
             low_actor_def = ActorVectorField(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=action_dim,
                 layer_norm=config['layer_norm'],
             )
-            ex_low_actor_in = (ex_observations, ex_z, ex_actions, ex_times)
+            ex_low_actor_in = (ex_observations, ex_low_actor_z, ex_actions, ex_times)
         elif config['pe_type'] == 'discrete':
             actor_def = GCDiscreteActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -694,7 +742,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
             subgoal_actor_def = GCActor(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=config['z_dim'],
                 layer_norm=config['layer_norm'],
                 state_dependent_std=False,
@@ -702,11 +750,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             )
             ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
             low_actor_def = GCDiscreteActor(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=config['pe_discrete']['action_ct'],
                 layer_norm=config['layer_norm'],
             )
-            ex_low_actor_in = (ex_observations, ex_z, ex_actions)
+            ex_low_actor_in = (ex_observations, ex_low_actor_z, ex_actions)
         else:
             actor_def = GCActor(
                 hidden_dims=config['actor_hidden_dims'],
@@ -717,7 +765,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
             subgoal_actor_def = GCActor(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=config['z_dim'],
                 layer_norm=config['layer_norm'],
                 state_dependent_std=False,
@@ -725,13 +773,13 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             )
             ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
             low_actor_def = GCActor(
-                hidden_dims=config['actor_hidden_dims'],
+                hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=action_dim,
                 layer_norm=config['layer_norm'],
                 state_dependent_std=False,
                 const_std=pe_info['const_std'],
             )
-            ex_low_actor_in = (ex_observations, ex_z, ex_actions)
+            ex_low_actor_in = (ex_observations, ex_low_actor_z, ex_actions)
 
         ex_q_short_goals = ex_goals
         # No actions in value function inputs
@@ -771,6 +819,7 @@ def get_config():
             batch_size=1024,
             actor_hidden_dims=(1024,) * 4,
             value_hidden_dims=(1024,) * 4,
+            high_actor_hidden_dims=(256,) * 4,  # Subgoal actor + low actor (auxiliary, not used at inference).
             layer_norm=True,
             discount=0.999,
             tau=0.005,
@@ -784,6 +833,7 @@ def get_config():
             value_maximization_interval=1,
             value_maximization_fallback='none',  # none or in-trajectory
             value_maximization_weight=1.0,
+            value_maximization_ramp_steps=0,  # Linear ramp from in-trajectory to generative over this many steps (0 = pure generative).
             value_sample_expectile=0.7,
             value_sample_expectile_iters=5,
             subgoal_num_samples=32,
@@ -791,6 +841,8 @@ def get_config():
             subgoal_actor_bc_coef=1.0,
             subgoal_actor_value_coef=0.0,
             low_actor_bc_coef=1.0,
+            low_actor_goal_conditioned=False,  # Whether low actor sees the subgoal goal (value goal) in addition to z.
+            low_actor_true_goal_conditioned=False,  # Whether low actor sees the true task goal in addition to z.
             use_high_policy_inference=False,
             pe_type='frs',  # frs (flow rejection sampling), rpg (reparameterized grads), discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
