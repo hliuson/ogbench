@@ -838,12 +838,10 @@ class DiscreteLatentTRLAgent(flax.struct.PyTreeNode):
                     (pe_info['num_samples'], *observations.shape[:-1], 1),
                     i / pe_info['flow_steps'],
                 )
-                vels = self.network.select('actor')(n_observations, n_goals, n_actions, t)
+                vels = self.network.select('low_actor')(n_observations, n_goals, n_actions, t)
                 n_actions = n_actions + vels / pe_info['flow_steps']
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            # Use Q_short(s, g, a) for rejection sampling
-            # Q_short was distilled from V(s', g), so it scores actions without needing dynamics
             q_short = self.network.select('q_short')(n_observations, goals=n_goals, actions=n_actions)
 
             if len(observations.shape) == 2:
@@ -854,8 +852,7 @@ class DiscreteLatentTRLAgent(flax.struct.PyTreeNode):
             return actions
 
         else:
-            actor_module = 'low_actor' if self._low_actor_goal_conditioning() == 'actual' else 'actor'
-            dist = self.network.select(actor_module)(observations, goals, temperature=temperature)
+            dist = self.network.select('low_actor')(observations, goals, temperature=temperature)
             actions = dist.sample(seed=seed)
 
             if self.config['pe_type'] != 'discrete':
