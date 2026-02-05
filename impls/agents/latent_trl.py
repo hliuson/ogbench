@@ -16,6 +16,7 @@ from utils.networks import (
     GCDiscreteActor,
     GCValue,
     MLP,
+    ResMLPActorVectorFieldDualHead,
     TimeConditioner,
 )
 
@@ -954,14 +955,25 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                     layer_norm=config['layer_norm'],
                 )
             if subgoal_flow_type == 'imf':
-                head_hidden_dims = imf_cfg.get('head_hidden_dims', None)
-                subgoal_actor_def = ActorVectorFieldDualHead(
-                    hidden_dims=config['high_actor_hidden_dims'],
-                    action_dim=config['z_dim'],
-                    layer_norm=config['layer_norm'],
-                    time_encoder=time_encoder,
-                    head_hidden_dims=head_hidden_dims,
-                )
+                use_resmlp = imf_cfg.get('use_resmlp', False)
+                if use_resmlp:
+                    resmlp_hidden_dim = imf_cfg.get('resmlp_hidden_dim', 256)
+                    resmlp_num_blocks = imf_cfg.get('resmlp_num_blocks', 8)
+                    subgoal_actor_def = ResMLPActorVectorFieldDualHead(
+                        hidden_dim=resmlp_hidden_dim,
+                        num_blocks=resmlp_num_blocks,
+                        action_dim=config['z_dim'],
+                        time_encoder=time_encoder,
+                    )
+                else:
+                    head_hidden_dims = imf_cfg.get('head_hidden_dims', None)
+                    subgoal_actor_def = ActorVectorFieldDualHead(
+                        hidden_dims=config['high_actor_hidden_dims'],
+                        action_dim=config['z_dim'],
+                        layer_norm=config['layer_norm'],
+                        time_encoder=time_encoder,
+                        head_hidden_dims=head_hidden_dims,
+                    )
             else:
                 subgoal_actor_def = ActorVectorField(
                     hidden_dims=config['high_actor_hidden_dims'],
@@ -1007,6 +1019,19 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         network_def = ModuleDict(networks)
         network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
+
+        # Print network architecture and parameter counts
+        print("\n" + "=" * 60)
+        print("Network Architecture - Parameter Counts")
+        print("=" * 60)
+        total_params = 0
+        for name, params in network_params.items():
+            module_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
+            total_params += module_params
+            print(f"  {name:<30} {module_params:>12,} params")
+        print("-" * 60)
+        print(f"  {'TOTAL':<30} {total_params:>12,} params")
+        print("=" * 60 + "\n")
 
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
@@ -1060,6 +1085,9 @@ def get_config():
                     adaptive_loss_eps=0.01,  # Official iMF adaptive loss epsilon.
                     adaptive_loss_p=1.0,  # Official iMF adaptive loss power.
                     head_hidden_dims=None,  # Optional per-head MLP dims for (u, v) heads.
+                    use_resmlp=False,  # Use ResMLP architecture for subgoal actor.
+                    resmlp_hidden_dim=256,  # ResMLP hidden dimension.
+                    resmlp_num_blocks=8,  # ResMLP number of residual blocks.
                     time_embed_num_freqs=32,
                     time_embed_hidden_dim=128,
                     time_embed_dim=128,

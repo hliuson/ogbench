@@ -694,6 +694,56 @@ class ResMLPActorVectorField(nn.Module):
         return v
 
 
+class ResMLPActorVectorFieldDualHead(nn.Module):
+    """Actor vector field with dual heads (u, v) for iMF using ResMLP architecture.
+
+    Attributes:
+        hidden_dim: Hidden dimension for ResMLP.
+        num_blocks: Number of residual blocks.
+        action_dim: Action dimension.
+        time_encoder: Optional module to encode time inputs.
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 8
+    action_dim: int = 1
+    time_encoder: nn.Module = None
+
+    @nn.compact
+    def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
+        """Return (u, v) vector fields."""
+        if goals is None:
+            inputs = observations
+        else:
+            inputs = jnp.concatenate([observations, goals], axis=-1)
+
+        if times is not None:
+            if self.time_encoder is not None:
+                times = self.time_encoder(times)
+            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
+        else:
+            inputs = jnp.concatenate([inputs, actions], axis=-1)
+
+        # Initial projection to hidden_dim
+        x = nn.Dense(self.hidden_dim)(inputs)
+        x = nn.LayerNorm()(x)
+        x = nn.swish(x)
+
+        # Residual blocks (shared trunk)
+        for _ in range(self.num_blocks):
+            residual = x
+            for _ in range(4):
+                x = nn.Dense(self.hidden_dim)(x)
+                x = nn.LayerNorm()(x)
+                x = nn.swish(x)
+            x = x + residual
+
+        # Dual heads
+        u = nn.Dense(self.action_dim, name='u_head')(x)
+        v = nn.Dense(self.action_dim, name='v_head')(x)
+        return u, v
+
+
 class ActorVectorField(nn.Module):
     """Actor vector field for flow policies.
 
