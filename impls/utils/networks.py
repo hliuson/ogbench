@@ -60,6 +60,55 @@ class MLP(nn.Module):
         return x
 
 
+class ScalarTimeEmbedding(nn.Module):
+    """Sinusoidal positional embedding for a scalar."""
+
+    num_freqs: int = 32
+    max_period: float = 10000.0
+    scale: float = 1.0
+
+    @nn.compact
+    def __call__(self, t):
+        if t.shape[-1] != 1:
+            t = t[..., None]
+        half_dim = self.num_freqs
+        inv_freq = jnp.exp(
+            -jnp.log(self.max_period) * jnp.arange(half_dim, dtype=t.dtype) / half_dim
+        )
+        emb = t * inv_freq * self.scale
+        return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+
+
+class TimeConditioner(nn.Module):
+    """Positional-embed each scalar time and sum MLP projections."""
+
+    num_freqs: int = 32
+    hidden_dim: int = 128
+    out_dim: int = 128
+    max_period: float = 10000.0
+    scale: float = 1.0
+    layer_norm: bool = False
+
+    @nn.compact
+    def __call__(self, times):
+        if times.ndim == 1:
+            times = times[..., None]
+        outputs = []
+        for i in range(times.shape[-1]):
+            emb = ScalarTimeEmbedding(
+                num_freqs=self.num_freqs,
+                max_period=self.max_period,
+                scale=self.scale,
+            )(times[..., i : i + 1])
+            proj = MLP(
+                (self.hidden_dim, self.out_dim),
+                activate_final=True,
+                layer_norm=self.layer_norm,
+            )(emb)
+            outputs.append(proj)
+        return sum(outputs)
+
+
 class LengthNormalize(nn.Module):
     """Length normalization layer.
 
@@ -630,7 +679,6 @@ class ResMLPActorVectorField(nn.Module):
             output_dim=self.action_dim,
         )
 
-    @nn.compact
     def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
         """Return the current vector."""
         if goals is None:
@@ -656,6 +704,7 @@ class ActorVectorField(nn.Module):
         activate_final: Whether to apply activation to the final layer.
         layer_norm: Whether to apply layer normalization.
         gc_encoder: Optional GCEncoder module to encode the inputs.
+        time_encoder: Optional module to encode time inputs.
     """
 
     hidden_dims: Sequence[int]
@@ -664,6 +713,7 @@ class ActorVectorField(nn.Module):
     activate_final: bool = False
     layer_norm: bool = False
     gc_encoder: nn.Module = None
+    time_encoder: nn.Module = None
 
     def setup(self):
         self.mlp = self.mlp_class(
@@ -694,8 +744,76 @@ class ActorVectorField(nn.Module):
         if times is None:
             inputs = jnp.concatenate([inputs, actions], axis=-1)
         else:
+            if self.time_encoder is not None:
+                times = self.time_encoder(times)
             inputs = jnp.concatenate([inputs, actions, times], axis=-1)
 
         v = self.mlp(inputs)
 
         return v
+
+
+class ActorVectorFieldDualHead(nn.Module):
+    """Actor vector field with dual heads (u, v) for iMF.
+
+    Attributes:
+        hidden_dims: Hidden layer dimensions for the shared trunk.
+        action_dim: Action dimension.
+        mlp_class: MLP class.
+        layer_norm: Whether to apply layer normalization.
+        gc_encoder: Optional GCEncoder module to encode the inputs.
+        time_encoder: Optional module to encode time inputs.
+        head_hidden_dims: Optional hidden dims for each head MLP. If None, use linear heads.
+    """
+
+    hidden_dims: Sequence[int]
+    action_dim: int
+    mlp_class: Any = MLP
+    layer_norm: bool = False
+    gc_encoder: nn.Module = None
+    time_encoder: nn.Module = None
+    head_hidden_dims: Optional[Sequence[int]] = None
+
+    def setup(self):
+        self.trunk = self.mlp_class(
+            self.hidden_dims, activate_final=True, layer_norm=self.layer_norm
+        )
+        if self.head_hidden_dims:
+            self.u_head = self.mlp_class(
+                (*self.head_hidden_dims, self.action_dim),
+                activate_final=False,
+                layer_norm=self.layer_norm,
+            )
+            self.v_head = self.mlp_class(
+                (*self.head_hidden_dims, self.action_dim),
+                activate_final=False,
+                layer_norm=self.layer_norm,
+            )
+        else:
+            self.u_head = nn.Dense(self.action_dim, kernel_init=default_init())
+            self.v_head = nn.Dense(self.action_dim, kernel_init=default_init())
+
+    @nn.compact
+    def __call__(self, observations, goals=None, actions=None, times=None, is_encoded=False):
+        """Return (u, v) vector fields."""
+        if not is_encoded and self.gc_encoder is not None:
+            if goals is None:
+                inputs = self.gc_encoder(observations)
+            else:
+                inputs = self.gc_encoder(observations, goals)
+        else:
+            if goals is None:
+                inputs = observations
+            else:
+                inputs = jnp.concatenate([observations, goals], axis=-1)
+        if times is None:
+            inputs = jnp.concatenate([inputs, actions], axis=-1)
+        else:
+            if self.time_encoder is not None:
+                times = self.time_encoder(times)
+            inputs = jnp.concatenate([inputs, actions, times], axis=-1)
+
+        feats = self.trunk(inputs)
+        u = self.u_head(feats)
+        v = self.v_head(feats)
+        return u, v

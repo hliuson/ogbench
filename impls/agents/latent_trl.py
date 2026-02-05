@@ -8,12 +8,15 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.flows import imf_cfg_loss, imf_loss, imf_one_shot_sample
 from utils.networks import (
     ActorVectorField,
+    ActorVectorFieldDualHead,
     GCActor,
     GCDiscreteActor,
     GCValue,
     MLP,
+    TimeConditioner,
 )
 
 class SubgoalEncoder(nn.Module):
@@ -44,6 +47,12 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
     def _get_pe_info(self):
         return self._get_pe_info_from_config(self.config)
 
+    def _subgoal_flow_type(self):
+        flow_type = self.config.get('subgoal_flow_type', 'auto')
+        if flow_type in (None, 'auto'):
+            return 'frs' if self.config['pe_type'] == 'frs' else 'dist'
+        return flow_type
+
     def _encode_subgoal(self, midpoint_observations, grad_params=None):
         if grad_params is None:
             return self.network.select('subgoal_encoder')(midpoint_observations)
@@ -51,11 +60,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
     def _sample_subgoals(self, observations, goals, rng, num_samples=None):
         """Sample latent subgoals from the high-level policy."""
-        pe_info = self._get_pe_info()
+        flow_type = self._subgoal_flow_type()
         if num_samples is None:
             num_samples = self.config['subgoal_num_samples']
 
-        if self.config['pe_type'] == 'frs':
+        if flow_type == 'frs':
             n_observations = jnp.repeat(jnp.expand_dims(observations, 0), num_samples, axis=0)
             n_goals = jnp.repeat(jnp.expand_dims(goals, 0), num_samples, axis=0)
 
@@ -76,8 +85,26 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 z = z + vels / self.config['subgoal_flow_steps']
             return z
 
-        dist = self.network.select('subgoal_actor')(observations, goals)
-        return dist.sample(seed=rng, sample_shape=(num_samples,))
+        if flow_type == 'imf':
+            n_observations = jnp.repeat(jnp.expand_dims(observations, 0), num_samples, axis=0)
+            n_goals = jnp.repeat(jnp.expand_dims(goals, 0), num_samples, axis=0)
+            sample_shape = (
+                num_samples,
+                *observations.shape[:-1],
+                self.config['z_dim'],
+            )
+            imf_cfg = self.config.get('subgoal_imf', None)
+            cfg_scale = 1.0 if imf_cfg is None else imf_cfg.get('cfg_scale', 1.0)
+
+            def vf(z, times):
+                return self.network.select('subgoal_actor')(n_observations, n_goals, z, times)
+
+            return imf_one_shot_sample(rng, sample_shape, vf, w=cfg_scale)
+
+        if flow_type == 'dist':
+            dist = self.network.select('subgoal_actor')(observations, goals)
+            return dist.sample(seed=rng, sample_shape=(num_samples,))
+        raise ValueError(f'Unsupported subgoal_flow_type: {flow_type}')
 
     def _expectile_agg(self, samples, tau, num_iters):
         """Compute expectile over samples with a small fixed-point iteration."""
@@ -312,6 +339,15 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         total_loss = v_loss.mean()
 
+        # Calibration: relative error between predicted and actual steps
+        # predicted_steps = log(V) / log(γ), actual_steps = k
+        # relative_gap = (predicted - actual) / actual
+        predicted_steps = jnp.log(vs + 1e-8) / jnp.log(self.config['discount'])
+        actual_steps = batch['value_offsets']
+        relative_gap = (predicted_steps - actual_steps) / (actual_steps + 1e-8)
+        info['calibration_rel_gap_mean'] = relative_gap.mean()
+        info['calibration_rel_gap_max'] = relative_gap.max()
+
         return total_loss, {
             'total_loss': total_loss,
             'v_loss': v_loss.mean(),
@@ -323,19 +359,20 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
     def subgoal_actor_loss(self, batch, grad_params, rng):
         """High-level subgoal proposer loss (flow-matching BC + optional value maximization)."""
-        rng, sample_rng = jax.random.split(rng, 2)
+        rng, flow_rng, sample_rng = jax.random.split(rng, 3)
         z_target = self._encode_subgoal(batch['value_midpoint_observations'])
         z_target = jax.lax.stop_gradient(z_target)
 
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
-        if self.config['pe_type'] != 'frs':
+        flow_type = self._subgoal_flow_type()
+        if flow_type == 'dist':
             dist = self.network.select('subgoal_actor')(
                 batch['observations'], batch[goal_key], params=grad_params
             )
             bc_loss = -dist.log_prob(z_target).mean()
-        else:
+        elif flow_type == 'frs':
             batch_size, z_dim = z_target.shape
-            x_rng, t_rng = jax.random.split(rng, 2)
+            x_rng, t_rng = jax.random.split(flow_rng, 2)
             x_0 = jax.random.normal(x_rng, (batch_size, z_dim))
             x_1 = z_target
             t = jax.random.uniform(t_rng, (batch_size, 1))
@@ -346,6 +383,72 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 batch['observations'], batch[goal_key], x_t, t, params=grad_params
             )
             bc_loss = jnp.mean((pred - y) ** 2)
+        elif flow_type == 'imf':
+            imf_cfg = self.config.get('subgoal_imf', None)
+            r_equals_t_prob = 0.0 if imf_cfg is None else imf_cfg.get('r_equals_t_prob', 0.0)
+            cfg_w_min = 1.0 if imf_cfg is None else imf_cfg.get('cfg_w_min', 1.0)
+            cfg_w_max = 1.0 if imf_cfg is None else imf_cfg.get('cfg_w_max', 1.0)
+            cfg_w_power = 1.0 if imf_cfg is None else imf_cfg.get('cfg_w_power', 1.0)
+            cfg_beta = None if imf_cfg is None else imf_cfg.get('cfg_beta', None)
+            class_dropout_prob = 0.1 if imf_cfg is None else imf_cfg.get('class_dropout_prob', 0.1)
+            logit_mean = -0.4 if imf_cfg is None else imf_cfg.get('logit_mean', -0.4)
+            logit_std = 1.0 if imf_cfg is None else imf_cfg.get('logit_std', 1.0)
+            adaptive_loss_eps = 0.01 if imf_cfg is None else imf_cfg.get('adaptive_loss_eps', 0.01)
+            adaptive_loss_p = 1.0 if imf_cfg is None else imf_cfg.get('adaptive_loss_p', 1.0)
+            use_cfg = cfg_w_max > cfg_w_min
+
+            goals = batch[goal_key]
+            zero_goals = jnp.zeros_like(goals)
+
+            def cond_fn(z_in, times_in):
+                return self.network.select('subgoal_actor')(
+                    batch['observations'],
+                    goals,
+                    z_in,
+                    times_in,
+                    params=grad_params,
+                )
+
+            def uncond_fn(z_in, times_in):
+                return self.network.select('subgoal_actor')(
+                    batch['observations'],
+                    zero_goals,
+                    z_in,
+                    times_in,
+                    params=grad_params,
+                )
+
+            if use_cfg:
+                bc_loss, _ = imf_cfg_loss(
+                    flow_rng,
+                    z_target,
+                    cond_fn,
+                    uncond_fn,
+                    r_equals_t_prob=r_equals_t_prob,
+                    w_min=cfg_w_min,
+                    w_max=cfg_w_max,
+                    w_power=cfg_w_power,
+                    cfg_beta=cfg_beta,
+                    class_dropout_prob=class_dropout_prob,
+                    logit_mean=logit_mean,
+                    logit_std=logit_std,
+                    adaptive_loss_eps=adaptive_loss_eps,
+                    adaptive_loss_p=adaptive_loss_p,
+                )
+            else:
+                bc_loss, _ = imf_loss(
+                    flow_rng,
+                    z_target,
+                    cond_fn,
+                    r_equals_t_prob=r_equals_t_prob,
+                    w=1.0,
+                    logit_mean=logit_mean,
+                    logit_std=logit_std,
+                    adaptive_loss_eps=adaptive_loss_eps,
+                    adaptive_loss_p=adaptive_loss_p,
+                )
+        else:
+            raise ValueError(f'Unsupported subgoal_flow_type: {flow_type}')
 
         total_loss = self.config['subgoal_actor_bc_coef'] * bc_loss
 
@@ -388,10 +491,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             value_loss = -q_best.mean()
             total_loss = total_loss + self.config['subgoal_actor_value_coef'] * value_loss
 
-        return total_loss, {
+        info = {
             'actor_loss': total_loss,
             'bc_loss': bc_loss,
         }
+        return total_loss, info
 
     def _low_actor_goal_conditioning(self):
         if 'low_actor_goal_conditioning' in self.config:
@@ -744,6 +848,9 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
         pe_info = cls._get_pe_info_from_config(config)
+        subgoal_flow_type = config.get('subgoal_flow_type', 'auto')
+        if subgoal_flow_type in (None, 'auto'):
+            subgoal_flow_type = 'frs' if config['pe_type'] == 'frs' else 'dist'
         ex_z = jnp.zeros((ex_observations.shape[0], config['z_dim']), dtype=ex_observations.dtype)
 
         # Build example low actor goal input based on conditioning.
@@ -797,12 +904,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions, ex_times)
-            subgoal_actor_def = ActorVectorField(
-                hidden_dims=config['high_actor_hidden_dims'],
-                action_dim=config['z_dim'],
-                layer_norm=config['layer_norm'],
-            )
-            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z, ex_times)
             low_actor_def = ActorVectorField(
                 hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=action_dim,
@@ -816,14 +917,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 layer_norm=config['layer_norm'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
-            subgoal_actor_def = GCActor(
-                hidden_dims=config['high_actor_hidden_dims'],
-                action_dim=config['z_dim'],
-                layer_norm=config['layer_norm'],
-                state_dependent_std=False,
-                const_std=pe_info['const_std'],
-            )
-            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
             low_actor_def = GCDiscreteActor(
                 hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=config['pe_discrete']['action_ct'],
@@ -839,14 +932,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 const_std=pe_info['const_std'],
             )
             ex_actor_in = (ex_observations, ex_goals, ex_actions)
-            subgoal_actor_def = GCActor(
-                hidden_dims=config['high_actor_hidden_dims'],
-                action_dim=config['z_dim'],
-                layer_norm=config['layer_norm'],
-                state_dependent_std=False,
-                const_std=pe_info['const_std'],
-            )
-            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
             low_actor_def = GCActor(
                 hidden_dims=config['high_actor_hidden_dims'],
                 action_dim=action_dim,
@@ -855,6 +940,53 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 const_std=pe_info['const_std'],
             )
             ex_low_actor_in = (ex_observations, ex_low_actor_z, ex_actions)
+
+        if subgoal_flow_type in ('frs', 'imf'):
+            time_encoder = None
+            if subgoal_flow_type == 'imf':
+                imf_cfg = config.get('subgoal_imf', {})
+                time_encoder = TimeConditioner(
+                    num_freqs=imf_cfg.get('time_embed_num_freqs', 32),
+                    hidden_dim=imf_cfg.get('time_embed_hidden_dim', 128),
+                    out_dim=imf_cfg.get('time_embed_dim', 128),
+                    max_period=imf_cfg.get('time_embed_max_period', 10000.0),
+                    scale=imf_cfg.get('time_embed_scale', 1.0),
+                    layer_norm=config['layer_norm'],
+                )
+            if subgoal_flow_type == 'imf':
+                head_hidden_dims = imf_cfg.get('head_hidden_dims', None)
+                subgoal_actor_def = ActorVectorFieldDualHead(
+                    hidden_dims=config['high_actor_hidden_dims'],
+                    action_dim=config['z_dim'],
+                    layer_norm=config['layer_norm'],
+                    time_encoder=time_encoder,
+                    head_hidden_dims=head_hidden_dims,
+                )
+            else:
+                subgoal_actor_def = ActorVectorField(
+                    hidden_dims=config['high_actor_hidden_dims'],
+                    action_dim=config['z_dim'],
+                    layer_norm=config['layer_norm'],
+                    time_encoder=time_encoder,
+                )
+            if subgoal_flow_type == 'imf':
+                ex_subgoal_times = jnp.zeros((*ex_actions.shape[:-1], 5), dtype=ex_actions.dtype)
+                ex_subgoal_times = ex_subgoal_times.at[..., 2].set(1.0)
+                ex_subgoal_times = ex_subgoal_times.at[..., 4].set(1.0)
+            else:
+                ex_subgoal_times = ex_times
+            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z, ex_subgoal_times)
+        elif subgoal_flow_type == 'dist':
+            subgoal_actor_def = GCActor(
+                hidden_dims=config['high_actor_hidden_dims'],
+                action_dim=config['z_dim'],
+                layer_norm=config['layer_norm'],
+                state_dependent_std=False,
+                const_std=pe_info['const_std'],
+            )
+            ex_subgoal_actor_in = (ex_observations, ex_value_goals, ex_z)
+        else:
+            raise ValueError(f'Unsupported subgoal_flow_type: {subgoal_flow_type}')
 
         ex_q_short_goals = ex_goals
         # No actions in value function inputs
@@ -913,6 +1045,28 @@ def get_config():
             value_sample_expectile_iters=5,
             subgoal_num_samples=32,
             subgoal_flow_steps=10,
+            subgoal_flow_type='auto',  # auto: use 'frs' if pe_type is frs else 'dist' (options: frs/imf/dist)
+            subgoal_imf=ml_collections.ConfigDict(
+                dict(
+                    r_equals_t_prob=0.75,  # Official iMF default is 0.5; we use 0.75 here.
+                    cfg_w_min=1.0,  # Train with w sampled from [w_min, w_max]
+                    cfg_w_max=8.0,  # Enables CFG training (higher for weaker models)
+                    cfg_w_power=1.0,  # Backward-compat fallback for cfg_beta when unset.
+                    cfg_beta=1.0,  # Official iMF CFG scale distribution parameter.
+                    cfg_scale=3.0,  # Inference CFG scale (higher for weaker models)
+                    class_dropout_prob=0.1,  # Official iMF classifier-free dropout.
+                    logit_mean=-0.4,  # Official iMF logit-normal mean.
+                    logit_std=1.0,  # Official iMF logit-normal std.
+                    adaptive_loss_eps=0.01,  # Official iMF adaptive loss epsilon.
+                    adaptive_loss_p=1.0,  # Official iMF adaptive loss power.
+                    head_hidden_dims=None,  # Optional per-head MLP dims for (u, v) heads.
+                    time_embed_num_freqs=32,
+                    time_embed_hidden_dim=128,
+                    time_embed_dim=128,
+                    time_embed_max_period=10000.0,
+                    time_embed_scale=1.0,
+                )
+            ),
             subgoal_actor_bc_coef=1.0,
             subgoal_actor_value_coef=0.0,
             low_actor_bc_coef=1.0,
