@@ -279,6 +279,10 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 )
             else:
                 target = q
+            # Optionally take hard max with in-trajectory as a floor
+            if self.config.get('value_maximization_intraj_floor', False):
+                q_intraj = compute_in_traj_target()  # shape: [batch]
+                target = jnp.maximum(target, q_intraj)
             return q, target
 
         def compute_generative_target():
@@ -1066,6 +1070,7 @@ def get_config():
             value_maximization_fallback='none',  # none or in-trajectory
             value_maximization_weight=1.0,
             value_maximization_ramp_steps=0,  # Linear ramp from in-trajectory to generative over this many steps (0 = pure generative).
+            value_maximization_intraj_floor=False,  # Take hard max with in-trajectory value as floor.
             value_sample_expectile=0.7,
             value_sample_expectile_iters=5,
             subgoal_num_samples=32,
