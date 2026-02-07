@@ -1065,7 +1065,7 @@ def get_config():
             q_agg='min',
             z_dim=8,
             value_maximization='in-trajectory',  # in-trajectory or generative
-            value_maximization_agg='max',  # max or expectile
+            value_maximization_agg='expectile',  # max or expectile
             value_maximization_interval=1,
             value_maximization_fallback='none',  # none or in-trajectory
             value_maximization_weight=1.0,
