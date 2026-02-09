@@ -17,6 +17,7 @@ from utils.networks import (
     GCValue,
     MLP,
     ResMLPActorVectorFieldDualHead,
+    ResMLPNetwork,
     TimeConditioner,
 )
 
@@ -30,6 +31,26 @@ class SubgoalEncoder(nn.Module):
     @nn.compact
     def __call__(self, x):
         return MLP((*self.hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
+
+
+class ResMLPSubgoalEncoder(nn.Module):
+    """ResMLP-based subgoal encoder: s_j -> z_j.
+
+    Uses residual MLP architecture for better gradient flow, especially
+    useful with contrastive auxiliary losses like CRTR.
+    """
+
+    hidden_dim: int = 256
+    num_blocks: int = 4
+    z_dim: int = 16
+
+    @nn.compact
+    def __call__(self, x):
+        return ResMLPNetwork(
+            hidden_dim=self.hidden_dim,
+            num_blocks=self.num_blocks,
+            output_dim=self.z_dim,
+        )(x)
 
 
 class LatentTRLAgent(flax.struct.PyTreeNode):
@@ -123,6 +144,80 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         log_not_pred = jax.nn.log_sigmoid(-pred_logit)
         loss = -(log_pred * target + log_not_pred * (1 - target))
         return loss
+
+    def crtr_loss(self, batch, grad_params):
+        """CRTR auxiliary contrastive loss on the latent z-space.
+
+        Encourages the subgoal encoder to learn temporally coherent representations
+        where states from the same trajectory have similar embeddings, with distance
+        proportional to temporal distance.
+
+        Uses in-trajectory negatives: for each (s, s_mid) positive pair, the negative
+        is another point from the same trajectory, making the contrastive task harder.
+        """
+        if self.config['crtr_coef'] <= 0:
+            return jnp.zeros(()), {}
+
+        # Encode current, midpoint, and in-trajectory negative observations
+        z_cur = self._encode_subgoal(batch['observations'], grad_params)
+        z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params)
+        z_neg = self._encode_subgoal(batch['intraj_negative_observations'], grad_params)
+
+        # Optionally normalize embeddings
+        if self.config.get('crtr_normalize', True):
+            z_cur = z_cur / (jnp.linalg.norm(z_cur, axis=-1, keepdims=True) + 1e-8)
+            z_mid = z_mid / (jnp.linalg.norm(z_mid, axis=-1, keepdims=True) + 1e-8)
+            z_neg = z_neg / (jnp.linalg.norm(z_neg, axis=-1, keepdims=True) + 1e-8)
+
+        # Temperature scaling
+        tau = self.config.get('crtr_tau')
+        if tau is None:
+            tau = 1.0 / jnp.sqrt(z_cur.shape[-1])
+
+        # Alignment loss: pull (s, s_mid) positive pairs together
+        l_align = jnp.sum((z_mid - z_cur) ** 2, axis=-1) * tau
+
+        # Uniformity loss with in-trajectory negatives
+        # For each sample i, we have:
+        #   - positive: z_mid[i] (same trajectory, geometrically sampled ahead)
+        #   - hard negative: z_neg[i] (same trajectory, different time)
+        #   - cross-traj negatives: z_mid[j] for j != i (different trajectories)
+
+        # Pairwise distances: z_cur[i] vs z_mid[j] for all i, j
+        # Note: divide by z_dim to match original CRTR scaling
+        z_dim = z_cur.shape[-1]
+        pdist_pos = jnp.sum((z_mid[:, None] - z_cur[None, :]) ** 2, axis=-1) * tau / z_dim
+
+        # Distance to in-trajectory negative: z_cur[i] vs z_neg[i]
+        dist_neg = jnp.sum((z_neg - z_cur) ** 2, axis=-1) * tau / z_dim
+
+        # Combine: for uniformity, we want to push apart from all negatives
+        # The denominator includes the positive (diagonal of pdist_pos) and all negatives
+        # We add the in-trajectory negative as an extra term
+        l_unif_cross = jax.nn.logsumexp(-pdist_pos, axis=1)  # cross-trajectory
+        l_unif_intraj = -dist_neg  # in-trajectory negative contribution
+
+        # Combine uniformity terms (logsumexp of both)
+        l_unif = jnp.logaddexp(l_unif_cross, l_unif_intraj)
+
+        # Total loss
+        loss = (l_align + z_cur.shape[-1] * l_unif).mean()
+
+        # Accuracy metrics
+        # For each row, check if the positive (diagonal) has smallest distance
+        accuracy = jnp.mean(jnp.argmin(pdist_pos, axis=1) == jnp.arange(z_cur.shape[0]))
+
+        # Also check if positive is closer than in-trajectory negative
+        pos_dist = jnp.diag(pdist_pos)
+        intraj_accuracy = jnp.mean(pos_dist < dist_neg)
+
+        return loss, {
+            'crtr_loss': loss,
+            'crtr_align': l_align.mean(),
+            'crtr_unif': l_unif.mean(),
+            'crtr_accuracy': accuracy,
+            'crtr_intraj_accuracy': intraj_accuracy,
+        }
 
     def q_short_loss(self, batch, grad_params):
         """Distill Q_short(s, g, a) from V(s', g).
@@ -733,7 +828,13 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             for k, v in low_actor_info.items():
                 info[f'low_actor/{k}'] = v
 
+        # CRTR auxiliary contrastive loss on z-space
+        crtr_loss, crtr_info = self.crtr_loss(batch, grad_params)
+        for k, v in crtr_info.items():
+            info[f'crtr/{k}'] = v
+
         loss = value_loss + q_loss + q_short_loss + actor_loss + subgoal_actor_loss + low_actor_loss
+        loss = loss + self.config['crtr_coef'] * crtr_loss
         return loss, info
 
     def target_update(self, network, module_name):
@@ -890,11 +991,18 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
-        subgoal_encoder_def = SubgoalEncoder(
-            hidden_dims=config['value_hidden_dims'],
-            layer_norm=config['layer_norm'],
-            z_dim=config['z_dim'],
-        )
+        if config.get('subgoal_encoder_resmlp', False):
+            subgoal_encoder_def = ResMLPSubgoalEncoder(
+                hidden_dim=config.get('subgoal_encoder_resmlp_hidden_dim', 256),
+                num_blocks=config.get('subgoal_encoder_resmlp_num_blocks', 4),
+                z_dim=config['z_dim'],
+            )
+        else:
+            subgoal_encoder_def = SubgoalEncoder(
+                hidden_dims=config['value_hidden_dims'],
+                layer_norm=config['layer_norm'],
+                z_dim=config['z_dim'],
+            )
         # Short-horizon Q distilled from V(s', g) for rejection sampling
         q_short_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
@@ -1103,6 +1211,14 @@ def get_config():
             subgoal_actor_bc_coef=1.0,
             subgoal_actor_value_coef=0.0,
             low_actor_bc_coef=1.0,
+            # CRTR auxiliary loss parameters
+            crtr_coef=0.0,  # CRTR loss coefficient (0 = disabled)
+            crtr_normalize=True,  # L2-normalize embeddings before computing distances
+            crtr_tau=None,  # Temperature (None = 1/sqrt(z_dim))
+            # Subgoal encoder architecture
+            subgoal_encoder_resmlp=False,  # Use ResMLP encoder (better for CRTR)
+            subgoal_encoder_resmlp_hidden_dim=256,  # Hidden dim for ResMLP encoder
+            subgoal_encoder_resmlp_num_blocks=4,  # Num blocks for ResMLP encoder
             low_actor_goal_conditioning='actual',  # 'actual', 'latent', or 'both'
             low_actor_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.
             low_actor_true_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.

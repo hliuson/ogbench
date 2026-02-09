@@ -275,6 +275,23 @@ class GCDataset:
                 batch['value_cur_goals'] = self.get_observations(idxs)
                 batch['value_next_goals'] = self.get_observations(idxs + 1)
 
+            # Sample in-trajectory negatives for CRTR auxiliary loss.
+            # Sample a random point from the same trajectory (different from midpoint).
+            initial_state_idxs = self.initial_locs[np.searchsorted(self.initial_locs, idxs, side='right') - 1]
+            traj_lengths = final_state_idxs - initial_state_idxs + 1
+            # Sample random offset within trajectory, then shift to avoid midpoint
+            intraj_neg_offsets = np.random.randint(0, traj_lengths - 1)
+            intraj_neg_idxs = initial_state_idxs + intraj_neg_offsets
+            # If we hit the midpoint, shift by 1
+            intraj_neg_idxs = np.where(
+                intraj_neg_idxs >= value_midpoint_idxs,
+                intraj_neg_idxs + 1,
+                intraj_neg_idxs,
+            )
+            # Clamp to trajectory bounds (in case we shifted past the end)
+            intraj_neg_idxs = np.minimum(intraj_neg_idxs, final_state_idxs)
+            batch['intraj_negative_observations'] = self.get_observations(intraj_neg_idxs)
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals']
@@ -287,6 +304,7 @@ class GCDataset:
                             'value_midpoint_goals',
                             'value_cur_goals',
                             'value_next_goals',
+                            'intraj_negative_observations',
                         ]
                     )
                 self.augment(batch, aug_keys)
