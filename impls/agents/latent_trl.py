@@ -21,16 +21,45 @@ from utils.networks import (
     TimeConditioner,
 )
 
+def apply_sem(z, sem_l, sem_v):
+    """Apply Simplicial Embeddings (SEM) to latent representation.
+
+    Divides the embedding into L groups of size V and applies softmax
+    independently over each group.
+
+    Args:
+        z: Latent representation of shape [..., sem_l * sem_v]
+        sem_l: Number of groups (L)
+        sem_v: Size of each group (V)
+
+    Returns:
+        Simplicial embedding of same shape as input.
+    """
+    *batch_dims, z_dim = z.shape
+    if z_dim != sem_l * sem_v:
+        raise ValueError(f'z_dim ({z_dim}) must equal sem_l * sem_v ({sem_l} * {sem_v})')
+    # Reshape to [..., L, V], apply softmax over V dimension, reshape back
+    z_reshaped = z.reshape(*batch_dims, sem_l, sem_v)
+    z_softmax = jax.nn.softmax(z_reshaped, axis=-1)
+    return z_softmax.reshape(*batch_dims, z_dim)
+
+
 class SubgoalEncoder(nn.Module):
     """Subgoal encoder: s_j -> z_j."""
 
     hidden_dims: Sequence[int]
     layer_norm: bool
     z_dim: int
+    use_sem: bool = False
+    sem_l: int = 8
+    sem_v: int = 8
 
     @nn.compact
     def __call__(self, x):
-        return MLP((*self.hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
+        z = MLP((*self.hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
+        if self.use_sem:
+            z = apply_sem(z, self.sem_l, self.sem_v)
+        return z
 
 
 class ResMLPSubgoalEncoder(nn.Module):
@@ -43,14 +72,32 @@ class ResMLPSubgoalEncoder(nn.Module):
     hidden_dim: int = 256
     num_blocks: int = 4
     z_dim: int = 16
+    use_sem: bool = False
+    sem_l: int = 8
+    sem_v: int = 8
 
     @nn.compact
     def __call__(self, x):
-        return ResMLPNetwork(
+        z = ResMLPNetwork(
             hidden_dim=self.hidden_dim,
             num_blocks=self.num_blocks,
             output_dim=self.z_dim,
         )(x)
+        if self.use_sem:
+            z = apply_sem(z, self.sem_l, self.sem_v)
+        return z
+
+
+class IdentitySubgoalEncoder(nn.Module):
+    """Identity subgoal encoder: z = s (no encoding).
+
+    Used as ablation to test if the encoder is actually needed.
+    z_dim should match observation dimension.
+    """
+
+    @nn.compact
+    def __call__(self, x):
+        return x
 
 
 class LatentTRLAgent(flax.struct.PyTreeNode):
@@ -75,10 +122,33 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             return 'frs' if self.config['pe_type'] == 'frs' else 'dist'
         return flow_type
 
-    def _encode_subgoal(self, midpoint_observations, grad_params=None):
+    def _use_delayed_subgoal_encoder(self):
+        return self.config.get('use_delayed_subgoal_encoder', False)
+
+    def _subgoal_encoder_tau(self):
+        return self.config.get('subgoal_encoder_tau', 0.005)
+
+    def _hierarchical_policy(self):
+        return self.config.get('hierarchical_policy', 'none')
+
+    def _hierarchical_latent_low_actor_backprop_encoder(self):
+        return self.config.get('hierarchical_latent_low_actor_backprop_encoder', False)
+
+    @staticmethod
+    def _hierarchical_target_observations(batch):
+        return batch.get('hierarchical_target_observations', batch['value_midpoint_observations'])
+
+    def _encode_subgoal(self, midpoint_observations, grad_params=None, use_target=False):
+        module_name = (
+            'target_subgoal_encoder'
+            if use_target and self._use_delayed_subgoal_encoder()
+            else 'subgoal_encoder'
+        )
         if grad_params is None:
-            return self.network.select('subgoal_encoder')(midpoint_observations)
-        return self.network.select('subgoal_encoder')(midpoint_observations, params=grad_params)
+            return self.network.select(module_name)(midpoint_observations)
+        if module_name != 'subgoal_encoder':
+            raise ValueError('grad_params are only supported for the online subgoal_encoder.')
+        return self.network.select(module_name)(midpoint_observations, params=grad_params)
 
     def _sample_subgoals(self, observations, goals, rng, num_samples=None):
         """Sample latent subgoals from the high-level policy."""
@@ -300,13 +370,31 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
         q_loss = dist_weight * self.bce_loss(q_logits, jax.lax.stop_gradient(target))
         total_loss = q_loss.mean()
-
-        return total_loss, {
-            'total_loss': total_loss,
+        info = {
             'q_loss': q_loss.mean(),
             'q_mean': qs.mean(),
             'q_max': qs.max(),
             'q_min': qs.min(),
+        }
+
+        if self.config['oracle_distill']:
+            oracle_q_logits = self.network.select('oracle_q')(
+                batch['observations'],
+                goals=batch['value_goals'],
+                actions=z_mid,
+                params=grad_params,
+            )
+            oracle_q = jax.nn.sigmoid(oracle_q_logits)
+            oracle_distill_loss = self.bce_loss(oracle_q_logits, jax.lax.stop_gradient(qs)).mean()
+            total_loss = total_loss + self.config['oracle_q_distill_coef'] * oracle_distill_loss
+            info['oracle_q_distill_loss'] = oracle_distill_loss
+            info['oracle_q_mean'] = oracle_q.mean()
+            info['oracle_q_max'] = oracle_q.max()
+            info['oracle_q_min'] = oracle_q.min()
+
+        return total_loss, {
+            'total_loss': total_loss,
+            **info,
         }
 
     def value_loss(self, batch, grad_params, rng=None):
@@ -320,7 +408,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         vs = jax.nn.sigmoid(v_logits)
 
         def compute_in_traj_target():
-            z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
+            z_mid = self._encode_subgoal(batch['value_midpoint_observations'], use_target=True)
             z_mid = jax.lax.stop_gradient(z_mid)
             q_logits = self.network.select('target_q')(
                 batch['observations'],
@@ -459,8 +547,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
     def subgoal_actor_loss(self, batch, grad_params, rng):
         """High-level subgoal proposer loss (flow-matching BC + optional value maximization)."""
+        if self.config['value_maximization'] == 'in-trajectory':
+            # Keep legacy behavior when high-policy inference is enabled. Otherwise the
+            # subgoal actor is unused under in-trajectory value targets.
+            if self._hierarchical_policy() != 'none' or not self._use_high_policy_inference():
+                return jnp.zeros(()), {}
+
         rng, flow_rng, sample_rng = jax.random.split(rng, 3)
-        z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_target = self._encode_subgoal(batch['value_midpoint_observations'], use_target=True)
         z_target = jax.lax.stop_gradient(z_target)
 
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
@@ -597,6 +691,51 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         }
         return total_loss, info
 
+    def state_predictor_loss(self, batch, grad_params, rng):
+        """Hierarchical state predictor loss: flow BC to predict future state s_{t+n}.
+
+        This trains a flow policy to predict future states for hierarchical inference.
+        At inference, predicted states are encoded to z and evaluated with Q(s, z, g).
+        """
+        hierarchical_policy = self._hierarchical_policy()
+        if hierarchical_policy == 'none':
+            return jnp.zeros(()), {}
+
+        # Hierarchical inference only has access to runtime env goals, so train on value_goals.
+        goal_key = 'value_goals'
+
+        # Use fixed-horizon target if available, otherwise fall back to value_midpoint.
+        target_obs = self._hierarchical_target_observations(batch)
+
+        if hierarchical_policy == 'state':
+            # Predict actual future state s_{t+n}
+            target = target_obs
+        elif hierarchical_policy == 'latent':
+            # Predict latent z directly (similar to subgoal_actor but for inference)
+            target = self._encode_subgoal(target_obs, use_target=True)
+            target = jax.lax.stop_gradient(target)
+        else:
+            raise ValueError(f'Unsupported hierarchical_policy: {hierarchical_policy}')
+
+        batch_size = target.shape[0]
+        target_dim = target.shape[-1]
+        x_rng, t_rng = jax.random.split(rng, 2)
+
+        x_0 = jax.random.normal(x_rng, (batch_size, target_dim))
+        x_1 = target
+        t = jax.random.uniform(t_rng, (batch_size, 1))
+        x_t = (1 - t) * x_0 + t * x_1
+        y = x_1 - x_0
+
+        pred = self.network.select('state_predictor')(
+            batch['observations'], batch[goal_key], x_t, t, params=grad_params
+        )
+        bc_loss = jnp.mean((pred - y) ** 2)
+
+        return bc_loss, {
+            'bc_loss': bc_loss,
+        }
+
     def _low_actor_goal_conditioning(self):
         if 'low_actor_goal_conditioning' in self.config:
             return self.config['low_actor_goal_conditioning']
@@ -637,11 +776,28 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
     def low_actor_loss(self, batch, grad_params, rng):
         """Low-level actor loss conditioned on latent subgoals."""
-        z_target = self._encode_subgoal(batch['value_midpoint_observations'])
-        z_target = jax.lax.stop_gradient(z_target)
+        hierarchical_policy = self._hierarchical_policy()
 
-        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
-        z_goals = self._low_actor_goals(z_target, batch[goal_key], batch.get('actor_goals'))
+        # For hierarchical policies, condition ONLY on the predicted subgoal (state or z).
+        if hierarchical_policy == 'state':
+            # Condition on the same state target used for the hierarchical predictor.
+            z_goals = self._hierarchical_target_observations(batch)
+        elif hierarchical_policy == 'latent':
+            # Condition on latent z encoded from the hierarchical target state.
+            target_obs = self._hierarchical_target_observations(batch)
+            if self._hierarchical_latent_low_actor_backprop_encoder():
+                # Optional policy-side supervision for z: backprop low-actor BC into
+                # the online encoder so latent features can become action-relevant.
+                z_goals = self._encode_subgoal(target_obs, grad_params=grad_params, use_target=False)
+            else:
+                z_target = self._encode_subgoal(target_obs, use_target=True)
+                z_goals = jax.lax.stop_gradient(z_target)
+        else:
+            # Default: use _low_actor_goals routing
+            z_target = self._encode_subgoal(batch['value_midpoint_observations'], use_target=True)
+            z_target = jax.lax.stop_gradient(z_target)
+            goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+            z_goals = self._low_actor_goals(z_target, batch[goal_key], batch.get('actor_goals'))
 
         if self.config['pe_type'] == 'frs':
             batch_size, action_dim = batch['actions'].shape
@@ -668,13 +824,17 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None):
         """Compute the actor loss."""
+        if self._hierarchical_policy() != 'none':
+            # Hierarchical inference uses state_predictor + low_actor directly.
+            return jnp.zeros(()), {}
+
         pe_info = self._get_pe_info()
         conditioning = self._low_actor_goal_conditioning()
 
         if conditioning is not None:
             rng = rng if rng is not None else self.rng
             rng, flow_rng = jax.random.split(rng, 2)
-            z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+            z_target = self._encode_subgoal(batch['value_midpoint_observations'], use_target=True)
             z_target = jax.lax.stop_gradient(z_target)
             goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
             z_goals = self._low_actor_goals(z_target, batch[goal_key], batch.get('actor_goals'))
@@ -799,7 +959,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         info = {}
         rng = rng if rng is not None else self.rng
 
-        rng, value_rng, actor_rng, subgoal_actor_rng, low_actor_rng = jax.random.split(rng, 5)
+        rng, value_rng, actor_rng, subgoal_actor_rng, low_actor_rng, state_pred_rng = jax.random.split(rng, 6)
 
         value_loss, value_info = self.value_loss(batch, grad_params, rng=value_rng)
         for k, v in value_info.items():
@@ -821,12 +981,21 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         for k, v in subgoal_actor_info.items():
             info[f'subgoal_actor/{k}'] = v
 
-        if self._low_actor_goal_conditioning() is not None:
+        if self._hierarchical_policy() != 'none':
+            low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
+            for k, v in low_actor_info.items():
+                info[f'low_actor/{k}'] = v
+        elif self._low_actor_goal_conditioning() is not None:
             low_actor_loss = jnp.zeros(())
         else:
             low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
             for k, v in low_actor_info.items():
                 info[f'low_actor/{k}'] = v
+
+        # Hierarchical state predictor loss
+        state_pred_loss, state_pred_info = self.state_predictor_loss(batch, grad_params, state_pred_rng)
+        for k, v in state_pred_info.items():
+            info[f'state_predictor/{k}'] = v
 
         # CRTR auxiliary contrastive loss on z-space
         crtr_loss, crtr_info = self.crtr_loss(batch, grad_params)
@@ -834,12 +1003,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             info[f'crtr/{k}'] = v
 
         loss = value_loss + q_loss + q_short_loss + actor_loss + subgoal_actor_loss + low_actor_loss
+        loss = loss + state_pred_loss
         loss = loss + self.config['crtr_coef'] * crtr_loss
         return loss, info
 
-    def target_update(self, network, module_name):
+    def target_update(self, network, module_name, tau=None):
+        tau = self.config['tau'] if tau is None else tau
         new_target_params = jax.tree_util.tree_map(
-            lambda p, tp: p * self.config['tau'] + tp * (1 - self.config['tau']),
+            lambda p, tp: p * tau + tp * (1 - tau),
             self.network.params[f'modules_{module_name}'],
             self.network.params[f'modules_target_{module_name}'],
         )
@@ -855,8 +1026,67 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'value')
         self.target_update(new_network, 'q')
+        if self.config['oracle_distill']:
+            self.target_update(new_network, 'oracle_q')
+        if self._use_delayed_subgoal_encoder():
+            self.target_update(new_network, 'subgoal_encoder', tau=self._subgoal_encoder_tau())
 
         return self.replace(network=new_network, rng=new_rng), info
+
+    def _sample_hierarchical_subgoals(self, observations, goals, rng):
+        """Sample subgoals using hierarchical state predictor with rejection sampling.
+
+        For 'state' mode: predict future states, encode to z, reject sample with Q(s,z,g).
+        For 'latent' mode: predict z directly, reject sample with Q(s,z,g).
+        """
+        num_samples = self.config['hierarchical_num_samples']
+        flow_steps = self.config['hierarchical_flow_steps']
+        hierarchical_policy = self._hierarchical_policy()
+
+        n_observations = jnp.repeat(jnp.expand_dims(observations, 0), num_samples, axis=0)
+        n_goals = jnp.repeat(jnp.expand_dims(goals, 0), num_samples, axis=0)
+
+        if hierarchical_policy == 'state':
+            output_dim = observations.shape[-1]
+        else:  # latent
+            output_dim = self.config['z_dim']
+
+        # Sample from state predictor flow
+        samples = jax.random.normal(
+            rng,
+            (num_samples, *observations.shape[:-1], output_dim),
+        )
+        for i in range(flow_steps):
+            t = jnp.full((num_samples, *observations.shape[:-1], 1), i / flow_steps)
+            vels = self.network.select('state_predictor')(n_observations, n_goals, samples, t)
+            samples = samples + vels / flow_steps
+
+        # Encode to z if predicting states
+        if hierarchical_policy == 'state':
+            z_samples = self._encode_subgoal(samples)
+        else:
+            z_samples = samples
+
+        # Rejection sample using Q(s, z, g)
+        q_module = 'target_oracle_q' if self.config['oracle_distill'] else 'target_q'
+        q_logits = self.network.select(q_module)(n_observations, goals=n_goals, actions=z_samples)
+        q = jax.nn.sigmoid(q_logits)
+        if self.config['q_agg'] == 'min':
+            q = jnp.minimum(q[0], q[1])
+        elif self.config['q_agg'] == 'mean':
+            q = q.mean(axis=0)
+
+        # Select best sample per batch element
+        if len(observations.shape) == 2:
+            best_idx = jnp.argmax(q, axis=0)
+            best_z = z_samples[best_idx, jnp.arange(observations.shape[0])]
+            best_state = samples[best_idx, jnp.arange(observations.shape[0])] if hierarchical_policy == 'state' else None
+        else:
+            best_idx = jnp.argmax(q)
+            best_z = z_samples[best_idx]
+            best_state = samples[best_idx] if hierarchical_policy == 'state' else None
+
+        return best_z, best_state
 
     @jax.jit
     def sample_actions(
@@ -867,6 +1097,59 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         temperature=1.0,
     ):
         pe_info = self._get_pe_info()
+        hierarchical_policy = self._hierarchical_policy()
+
+        # Hierarchical policy: use state predictor with rejection sampling
+        if hierarchical_policy != 'none':
+            high_seed, low_seed = jax.random.split(seed)
+            z, predicted_state = self._sample_hierarchical_subgoals(observations, goals, high_seed)
+
+            # Build low actor conditioning based on hierarchical mode.
+            # For hierarchical inference, condition ONLY on the predicted subgoal.
+            if hierarchical_policy == 'state':
+                # Condition low actor on predicted future state only
+                z_goals = predicted_state
+            else:
+                # Condition low actor on predicted latent z only
+                z_goals = z
+
+            # Low-level action sampling with optional rejection sampling
+            if self.config['pe_type'] == 'frs':
+                if self.config.get('hierarchical_low_rejection', True):
+                    # Rejection sampling at low level with Q_short
+                    n_observations = jnp.repeat(jnp.expand_dims(observations, 0), pe_info['num_samples'], axis=0)
+                    n_goals = jnp.repeat(jnp.expand_dims(goals, 0), pe_info['num_samples'], axis=0)
+                    n_z_goals = jnp.repeat(jnp.expand_dims(z_goals, 0), pe_info['num_samples'], axis=0)
+
+                    n_actions = jax.random.normal(
+                        low_seed,
+                        (pe_info['num_samples'], *observations.shape[:-1], self.config['action_dim']),
+                    )
+                    for i in range(pe_info['flow_steps']):
+                        t = jnp.full((pe_info['num_samples'], *observations.shape[:-1], 1), i / pe_info['flow_steps'])
+                        vels = self.network.select('low_actor')(n_observations, n_z_goals, n_actions, t)
+                        n_actions = n_actions + vels / pe_info['flow_steps']
+                    n_actions = jnp.clip(n_actions, -1, 1)
+
+                    q_short = self.network.select('q_short')(n_observations, goals=n_goals, actions=n_actions)
+                    if len(observations.shape) == 2:
+                        actions = n_actions[jnp.argmax(q_short, axis=0), jnp.arange(observations.shape[0])]
+                    else:
+                        actions = n_actions[jnp.argmax(q_short)]
+                else:
+                    # No rejection sampling at low level
+                    actions = jax.random.normal(low_seed, (*observations.shape[:-1], self.config['action_dim']))
+                    for i in range(pe_info['flow_steps']):
+                        t = jnp.full((*observations.shape[:-1], 1), i / pe_info['flow_steps'])
+                        vels = self.network.select('low_actor')(observations, z_goals, actions, t)
+                        actions = actions + vels / pe_info['flow_steps']
+                    actions = jnp.clip(actions, -1, 1)
+            else:
+                dist = self.network.select('low_actor')(observations, z_goals, temperature=temperature)
+                actions = dist.sample(seed=low_seed)
+                if self.config['pe_type'] != 'discrete':
+                    actions = jnp.clip(actions, -1, 1)
+            return actions
 
         if self._use_high_policy_inference():
             high_seed, low_seed = jax.random.split(seed)
@@ -958,27 +1241,54 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         if subgoal_flow_type in (None, 'auto'):
             subgoal_flow_type = 'frs' if config['pe_type'] == 'frs' else 'dist'
         ex_z = jnp.zeros((ex_observations.shape[0], config['z_dim']), dtype=ex_observations.dtype)
+        use_sem = config.get('z_use_sem', False)
+        sem_l = config.get('sem_l', 8)
+        sem_v = config.get('sem_v', 8)
+        hierarchical_policy = config.get('hierarchical_policy', 'none')
+
+        if hierarchical_policy not in ('none', 'state', 'latent'):
+            raise ValueError(f'Unsupported hierarchical_policy: {hierarchical_policy}')
+        if use_sem and config['z_dim'] != sem_l * sem_v:
+            raise ValueError(
+                f"z_use_sem=True requires z_dim == sem_l * sem_v, got {config['z_dim']} vs {sem_l}*{sem_v}"
+            )
+        if config.get('subgoal_encoder_identity', False):
+            if use_sem:
+                raise ValueError('subgoal_encoder_identity is incompatible with z_use_sem=True')
+            obs_dim = ex_observations.shape[-1]
+            if config['z_dim'] != obs_dim:
+                raise ValueError(
+                    f'subgoal_encoder_identity=True requires z_dim == observation_dim, got {config["z_dim"]} vs {obs_dim}'
+                )
 
         # Build example low actor goal input based on conditioning.
-        conditioning = config.get('low_actor_goal_conditioning')
-        if conditioning is None:
-            # Backward compatibility with boolean flags.
-            ex_low_actor_goal_parts = [ex_z]
-            if config.get('low_actor_goal_conditioned', False):
-                ex_low_actor_goal_parts.append(ex_value_goals)
-            if config.get('low_actor_true_goal_conditioned', False):
-                ex_low_actor_goal_parts.append(ex_goals)
-            ex_low_actor_z = (
-                jnp.concatenate(ex_low_actor_goal_parts, axis=-1)
-                if len(ex_low_actor_goal_parts) > 1
-                else ex_z
-            )
-        elif conditioning == 'latent':
+        if hierarchical_policy == 'state':
+            # Hierarchical state mode: low actor conditioned on predicted state (obs-sized)
+            ex_low_actor_z = ex_mid_obs
+        elif hierarchical_policy == 'latent':
+            # Hierarchical latent mode: low actor conditioned on predicted z
             ex_low_actor_z = ex_z
-        elif conditioning == 'actual':
-            ex_low_actor_z = ex_goals
         else:
-            ex_low_actor_z = jnp.concatenate([ex_z, ex_goals], axis=-1)
+            # Default: use low_actor_goal_conditioning routing
+            conditioning = config.get('low_actor_goal_conditioning')
+            if conditioning is None:
+                # Backward compatibility with boolean flags.
+                ex_low_actor_goal_parts = [ex_z]
+                if config.get('low_actor_goal_conditioned', False):
+                    ex_low_actor_goal_parts.append(ex_value_goals)
+                if config.get('low_actor_true_goal_conditioned', False):
+                    ex_low_actor_goal_parts.append(ex_goals)
+                ex_low_actor_z = (
+                    jnp.concatenate(ex_low_actor_goal_parts, axis=-1)
+                    if len(ex_low_actor_goal_parts) > 1
+                    else ex_z
+                )
+            elif conditioning == 'latent':
+                ex_low_actor_z = ex_z
+            elif conditioning == 'actual':
+                ex_low_actor_z = ex_goals
+            else:
+                ex_low_actor_z = jnp.concatenate([ex_z, ex_goals], axis=-1)
 
         # Action-free value function V(s, g)
         value_def = GCValue(
@@ -991,17 +1301,26 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
-        if config.get('subgoal_encoder_resmlp', False):
+        if config.get('subgoal_encoder_identity', False):
+            # Identity encoder: z = s (no encoding, ablation)
+            subgoal_encoder_def = IdentitySubgoalEncoder()
+        elif config.get('subgoal_encoder_resmlp', False):
             subgoal_encoder_def = ResMLPSubgoalEncoder(
                 hidden_dim=config.get('subgoal_encoder_resmlp_hidden_dim', 256),
                 num_blocks=config.get('subgoal_encoder_resmlp_num_blocks', 4),
                 z_dim=config['z_dim'],
+                use_sem=use_sem,
+                sem_l=sem_l,
+                sem_v=sem_v,
             )
         else:
             subgoal_encoder_def = SubgoalEncoder(
                 hidden_dims=config['value_hidden_dims'],
                 layer_norm=config['layer_norm'],
                 z_dim=config['z_dim'],
+                use_sem=use_sem,
+                sem_l=sem_l,
+                sem_v=sem_v,
             )
         # Short-horizon Q distilled from V(s', g) for rejection sampling
         q_short_def = GCValue(
@@ -1113,18 +1432,53 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             raise ValueError(f'Unsupported subgoal_flow_type: {subgoal_flow_type}')
 
         ex_q_short_goals = ex_goals
+
+        # Hierarchical state predictor: flow policy (s, g) -> s_{t+n} or z
+        state_predictor_def = None
+        ex_state_predictor_in = None
+        if hierarchical_policy != 'none':
+            if hierarchical_policy == 'state':
+                # Predict future state s_{t+n}
+                state_predictor_output_dim = ex_observations.shape[-1]
+                ex_state_pred_target = ex_mid_obs
+            else:  # latent
+                # Predict latent z directly
+                state_predictor_output_dim = config['z_dim']
+                ex_state_pred_target = ex_z
+
+            state_predictor_def = ActorVectorField(
+                hidden_dims=config['high_actor_hidden_dims'],
+                action_dim=state_predictor_output_dim,
+                layer_norm=config['layer_norm'],
+            )
+            ex_state_predictor_in = (ex_observations, ex_goals, ex_state_pred_target, ex_times)
+
         # No actions in value function inputs
-        network_info = dict(
-            subgoal_encoder=(subgoal_encoder_def, (ex_mid_obs,)),
-            value=(value_def, (ex_observations, ex_value_goals)),
-            target_value=(copy.deepcopy(value_def), (ex_observations, ex_value_goals)),
-            q=(q_def, (ex_observations, ex_value_goals, ex_z)),
-            target_q=(copy.deepcopy(q_def), (ex_observations, ex_value_goals, ex_z)),
-            q_short=(q_short_def, (ex_observations, ex_q_short_goals, ex_actions)),  # Q_short takes actions
-            actor=(actor_def, ex_actor_in),
-            subgoal_actor=(subgoal_actor_def, ex_subgoal_actor_in),
-            low_actor=(low_actor_def, ex_low_actor_in),
+        network_info = dict(subgoal_encoder=(subgoal_encoder_def, (ex_mid_obs,)))
+        if config.get('use_delayed_subgoal_encoder', False):
+            network_info['target_subgoal_encoder'] = (copy.deepcopy(subgoal_encoder_def), (ex_mid_obs,))
+        network_info.update(
+            dict(
+                value=(value_def, (ex_observations, ex_value_goals)),
+                target_value=(copy.deepcopy(value_def), (ex_observations, ex_value_goals)),
+                q=(q_def, (ex_observations, ex_value_goals, ex_z)),
+                target_q=(copy.deepcopy(q_def), (ex_observations, ex_value_goals, ex_z)),
+                q_short=(q_short_def, (ex_observations, ex_q_short_goals, ex_actions)),  # Q_short takes actions
+                actor=(actor_def, ex_actor_in),
+                subgoal_actor=(subgoal_actor_def, ex_subgoal_actor_in),
+                low_actor=(low_actor_def, ex_low_actor_in),
+            )
         )
+        if config['oracle_distill']:
+            network_info.update(
+                dict(
+                    oracle_q=(copy.deepcopy(q_def), (ex_observations, ex_goals, ex_z)),
+                    target_oracle_q=(copy.deepcopy(q_def), (ex_observations, ex_goals, ex_z)),
+                )
+            )
+        # Add hierarchical state predictor if enabled
+        if state_predictor_def is not None:
+            network_info['state_predictor'] = (state_predictor_def, ex_state_predictor_in)
         networks = {k: v[0] for k, v in network_info.items()}
         network_args = {k: v[1] for k, v in network_info.items()}
 
@@ -1150,6 +1504,10 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         params = network_params
         params['modules_target_value'] = params['modules_value']
         params['modules_target_q'] = params['modules_q']
+        if config['oracle_distill']:
+            params['modules_target_oracle_q'] = params['modules_oracle_q']
+        if config.get('use_delayed_subgoal_encoder', False):
+            params['modules_target_subgoal_encoder'] = params['modules_subgoal_encoder']
 
         config['action_dim'] = action_dim
         return cls(rng, network=network, config=flax.core.FrozenDict(**config))
@@ -1170,8 +1528,12 @@ def get_config():
             lam=0.0,
             expectile=0.7,
             oracle_distill=False,
+            oracle_q_distill_coef=1.0,
             q_agg='min',
             z_dim=8,
+            z_use_sem=False,  # Use Simplicial Embeddings (SEM) for subgoal latent
+            sem_l=8,  # Number of groups for SEM
+            sem_v=8,  # Size of each group for SEM (z_dim should equal sem_l * sem_v when z_use_sem=True)
             value_maximization='in-trajectory',  # in-trajectory or generative
             value_maximization_agg='expectile',  # max or expectile
             value_maximization_interval=1,
@@ -1216,13 +1578,25 @@ def get_config():
             crtr_normalize=True,  # L2-normalize embeddings before computing distances
             crtr_tau=None,  # Temperature (None = 1/sqrt(z_dim))
             # Subgoal encoder architecture
+            subgoal_encoder_identity=False,  # Use identity encoder (z = s, ablation)
             subgoal_encoder_resmlp=False,  # Use ResMLP encoder (better for CRTR)
             subgoal_encoder_resmlp_hidden_dim=256,  # Hidden dim for ResMLP encoder
             subgoal_encoder_resmlp_num_blocks=4,  # Num blocks for ResMLP encoder
+            use_delayed_subgoal_encoder=False,  # Use EMA-delayed subgoal encoder for latent targets.
+            subgoal_encoder_tau=0.005,  # EMA coefficient for delayed subgoal encoder.
             low_actor_goal_conditioning='actual',  # 'actual', 'latent', or 'both'
             low_actor_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.
             low_actor_true_goal_conditioned=False,  # Deprecated: use low_actor_goal_conditioning.
             use_high_policy_inference=False,  # Ignored when low_actor_goal_conditioning is set.
+            # Hierarchical policy: predict future state/latent, then condition low actor on it.
+            hierarchical_policy='none',  # 'none', 'state', or 'latent'
+            # 'state': predict s_{t+n}, encode to z via subgoal_encoder, rejection sample with Q(s,z,g)
+            # 'latent': predict z directly, rejection sample with Q(s,z,g)
+            hierarchical_latent_low_actor_backprop_encoder=False,  # If True, backprop low-actor BC through online subgoal encoder in latent hierarchy.
+            hierarchical_horizon=0,  # Fixed n-step horizon for state predictor (0 = use value_midpoint)
+            hierarchical_num_samples=32,  # Number of candidates for high-level rejection sampling
+            hierarchical_flow_steps=10,  # Flow steps for state/latent predictor
+            hierarchical_low_rejection=True,  # Whether to also rejection sample at low level with Q_short
             pe_type='frs',  # frs (flow rejection sampling), rpg (reparameterized grads), discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

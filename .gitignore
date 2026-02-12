@@ -17,6 +17,8 @@ uv.lock
 impls/exp/
 impls/slurm
 impls/slurm-*.out
+impls/results/
+impls/scripts/
 nohup.out
 **.out
 

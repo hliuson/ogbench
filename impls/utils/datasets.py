@@ -292,6 +292,14 @@ class GCDataset:
             intraj_neg_idxs = np.minimum(intraj_neg_idxs, final_state_idxs)
             batch['intraj_negative_observations'] = self.get_observations(intraj_neg_idxs)
 
+            # Fixed-horizon target for hierarchical state predictor.
+            # Sample s_{t+n} where n is fixed (clamped to trajectory bounds).
+            hierarchical_horizon = self.config.get('hierarchical_horizon', 0)
+            if hierarchical_horizon > 0:
+                hier_target_idxs = np.minimum(idxs + hierarchical_horizon, final_state_idxs)
+                batch['hierarchical_target_observations'] = self.get_observations(hier_target_idxs)
+                batch['hierarchical_target_offsets'] = hier_target_idxs - idxs
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals']
@@ -307,6 +315,8 @@ class GCDataset:
                             'intraj_negative_observations',
                         ]
                     )
+                    if 'hierarchical_target_observations' in batch:
+                        aug_keys.append('hierarchical_target_observations')
                 self.augment(batch, aug_keys)
 
         return batch
