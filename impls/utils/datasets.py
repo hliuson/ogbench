@@ -1,5 +1,7 @@
 import dataclasses
+import json
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -553,6 +555,7 @@ class HGCDataset(GCDataset):
 
         batch['high_value_reps'] = batch['observations']
         batch['high_value_goals'] = self.get_goal_observations(high_value_goal_idxs)
+        batch['high_value_goal_observations'] = self.get_observations(high_value_goal_idxs)
         batch['high_value_actions'] = self.get_high_actions(high_value_next_idxs, idxs)
         # high_value_next_observations is the next state observation, not a goal
         batch['high_value_next_observations'] = self.get_observations(high_value_next_idxs)
@@ -628,6 +631,7 @@ class HGCDataset(GCDataset):
         )
 
         batch['high_actor_goals'] = self.get_goal_observations(high_actor_goal_idxs)
+        batch['high_actor_goal_observations'] = self.get_observations(high_actor_goal_idxs)
         batch['high_actor_actions'] = self.get_high_actions(high_actor_next_idxs, idxs)
         # high_actor_next_observations is the next state observation, not a goal
         batch['high_actor_next_observations'] = self.get_observations(high_actor_next_idxs)
@@ -655,6 +659,7 @@ class HGCDataset(GCDataset):
                         'next_observations',
                         'value_goals',
                         'high_value_goals',
+                        'high_value_goal_observations',
                         'high_value_actions',
                         'high_value_next_observations',
                         'low_value_next_observations',
@@ -662,6 +667,7 @@ class HGCDataset(GCDataset):
                         'low_actor_goal_observations',
                         'low_actor_next_observations',
                         'high_actor_goals',
+                        'high_actor_goal_observations',
                         'high_actor_actions',
                         'high_actor_next_observations',
                         'high_actor_targets',

@@ -172,11 +172,93 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         enc_input = jnp.concatenate(inputs, axis=-1)
         return self.network.select('subgoal_encoder')(enc_input, params=grad_params)
 
+    def _encode_goal_latent(self, observations, goal_observations, grad_params=None):
+        """Encode goal observations into the separate goal-latent space."""
+        del observations
+        enc_goal_obs = self._encode_observations(goal_observations, grad_params)
+        return self.network.select('goal_latent_encoder')(enc_goal_obs, params=grad_params)
+
+    def _encode_high_goals(self, batch, goal_prefix, grad_params=None):
+        """Encode high-level goals for high value/critic/actor networks."""
+        goal_key = f'{goal_prefix}_goals'
+        goals = batch[goal_key]
+
+        goal_obs_key = f'{goal_prefix}_goal_observations'
+        if goal_obs_key in batch:
+            goal_observations = batch[goal_obs_key]
+        else:
+            goal_observations = goals
+
+        if self.config['separate_goal_subgoal_latent']:
+            return self._encode_goal_latent(
+                batch['observations'],
+                goal_observations,
+                grad_params,
+            )
+
+        if not self.config['shared_goal_subgoal_latent']:
+            return self._encode_goals(goals, grad_params)
+
+        return self._encode_subgoal(
+            batch['observations'],
+            goal_observations,
+            goals,
+            grad_params,
+        )
+
+    def oracle_goal_encoder_loss(self, batch, grad_params):
+        """Distill oracle goals into the shared latent goal/subgoal space."""
+        target_latent = self._encode_high_goals(batch, 'high_actor', grad_params)
+        target_latent = jax.lax.stop_gradient(target_latent)
+        pred_latent = self.network.select('oracle_goal_encoder')(
+            batch['high_actor_goals'], params=grad_params
+        )
+        distill_loss = jnp.mean((pred_latent - target_latent) ** 2)
+        total_loss = self.config['oracle_goal_encoder_coef'] * distill_loss
+        return total_loss, {
+            'distill_loss': distill_loss,
+            'total_loss': total_loss,
+        }
+
+    def oracle_high_critic_distill_loss(self, batch, grad_params):
+        """Distill Q(s, z_goal, z_subgoal) into Q(s, oracle_goal, z_subgoal)."""
+        enc_obs = self._encode_observations(batch['observations'], grad_params)
+        enc_teacher_goals = self._encode_high_goals(batch, 'high_value', grad_params)
+        z_actions = self._encode_subgoal(
+            batch['observations'],
+            batch['high_value_next_observations'],
+            batch['high_value_goals'],
+            grad_params,
+        )
+
+        teacher_q1, teacher_q2 = self.network.select('high_critic')(
+            enc_obs,
+            enc_teacher_goals,
+            z_actions,
+        )
+        teacher_q1 = jax.lax.stop_gradient(teacher_q1)
+        teacher_q2 = jax.lax.stop_gradient(teacher_q2)
+
+        oracle_goals = self._encode_goals(batch['high_value_goals'], grad_params)
+        oracle_q1, oracle_q2 = self.network.select('oracle_high_critic')(
+            enc_obs,
+            oracle_goals,
+            z_actions,
+            params=grad_params,
+        )
+
+        distill_loss = jnp.mean((oracle_q1 - teacher_q1) ** 2 + (oracle_q2 - teacher_q2) ** 2)
+        total_loss = self.config['oracle_critic_distill_coef'] * distill_loss
+        return total_loss, {
+            'distill_loss': distill_loss,
+            'total_loss': total_loss,
+        }
+
     def high_value_loss(self, batch, grad_params):
         """Compute the high-level SARSA value loss."""
         # Encode observations and goals for network inputs
         enc_obs = self._encode_observations(batch['observations'], grad_params)
-        enc_goals = self._encode_goals(batch['high_value_goals'], grad_params)
+        enc_goals = self._encode_high_goals(batch, 'high_value', grad_params)
 
         # Option-style subgoal encoding: (s, s', g) -> z
         z_target = self._encode_subgoal(
@@ -221,7 +303,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         """Compute the high-level SARSA critic loss."""
         # Encode observations and goals for network inputs
         enc_obs = self._encode_observations(batch['observations'], grad_params)
-        enc_goals = self._encode_goals(batch['high_value_goals'], grad_params)
+        enc_goals = self._encode_high_goals(batch, 'high_value', grad_params)
         enc_next_obs = self._encode_observations(batch['high_value_next_observations'], grad_params)
 
         next_v = self.network.select('high_value')(
@@ -266,7 +348,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         """Compute the high-level flow BC actor loss."""
         # Encode observations and goals for network inputs
         enc_obs = self._encode_observations(batch['observations'], grad_params)
-        enc_goals = self._encode_goals(batch['high_actor_goals'], grad_params)
+        enc_goals = self._encode_high_goals(batch, 'high_actor', grad_params)
 
         # Option-style subgoal encoding: (s, s', g) -> z
         # Don't pass grad_params - subgoal encoder shouldn't get gradients from actor loss
@@ -312,7 +394,13 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         )
         # Optionally condition low actor on the final goal as well
         if self.config['low_actor_goal_conditioned']:
-            if self.config['encode_goal']:
+            if self.config['separate_goal_subgoal_latent']:
+                high_goal_latent = self._encode_high_goals(batch, 'high_actor', grad_params)
+                z_goals = jnp.concatenate([z_goals, high_goal_latent], axis=-1)
+            elif self.config['shared_goal_subgoal_latent']:
+                high_goal_latent = self._encode_high_goals(batch, 'high_actor', grad_params)
+                z_goals = jnp.concatenate([z_goals, high_goal_latent], axis=-1)
+            elif self.config['encode_goal']:
                 encoded_goal = self.network.select('goal_encoder')(
                     batch['high_actor_goals'], params=grad_params
                 )
@@ -426,6 +514,18 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             for k, v in probe_info.items():
                 info[f'probe/{k}'] = v
 
+        if self.config['learn_oracle_goal_encoder']:
+            oracle_goal_loss, oracle_goal_info = self.oracle_goal_encoder_loss(batch, grad_params)
+            loss = loss + oracle_goal_loss
+            for k, v in oracle_goal_info.items():
+                info[f'oracle_goal_encoder/{k}'] = v
+
+        if self.config['oracle_critic_distill']:
+            oracle_critic_loss, oracle_critic_info = self.oracle_high_critic_distill_loss(batch, grad_params)
+            loss = loss + oracle_critic_loss
+            for k, v in oracle_critic_info.items():
+                info[f'oracle_high_critic/{k}'] = v
+
         return loss, info
 
     def target_update(self, network, module_name):
@@ -463,7 +563,28 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
 
         # Encode observations and goals
         enc_observations = self._encode_observations(observations)
-        enc_goals = self._encode_goals(goals)
+        if self.config['separate_goal_subgoal_latent']:
+            if self.config['learn_oracle_goal_encoder']:
+                enc_goals = self.network.select('oracle_goal_encoder')(goals)
+            else:
+                if goals.shape[-1] != observations.shape[-1]:
+                    raise ValueError(
+                        'separate_goal_subgoal_latent=True with oracle goals requires '
+                        'learn_oracle_goal_encoder=True.'
+                    )
+                enc_goals = self._encode_goal_latent(observations, goals)
+        elif self.config['shared_goal_subgoal_latent']:
+            if self.config['learn_oracle_goal_encoder']:
+                enc_goals = self.network.select('oracle_goal_encoder')(goals)
+            else:
+                if goals.shape[-1] != observations.shape[-1]:
+                    raise ValueError(
+                        'shared_goal_subgoal_latent=True with oracle goals requires '
+                        'learn_oracle_goal_encoder=True.'
+                    )
+                enc_goals = self._encode_subgoal(observations, goals, goals)
+        else:
+            enc_goals = self._encode_goals(goals)
 
         # High-level: rejection sampling.
         n_subgoals = jax.random.normal(
@@ -482,13 +603,26 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             vels = self.network.select('high_actor_flow')(n_enc_observations, n_enc_goals, n_subgoals, t)
             n_subgoals = n_subgoals + vels / self.config['flow_steps']
 
-        q = self.network.select('high_critic')(n_enc_observations, goals=n_enc_goals, actions=n_subgoals).min(axis=0)
+        if self.config['oracle_critic_distill'] and self.config['oracle_critic_use_for_inference']:
+            oracle_goals = self._encode_goals(goals)
+            n_oracle_goals = jnp.repeat(jnp.expand_dims(oracle_goals, 0), self.config['num_samples'], axis=0)
+            q = self.network.select('oracle_high_critic')(
+                n_enc_observations,
+                goals=n_oracle_goals,
+                actions=n_subgoals,
+            ).min(axis=0)
+        else:
+            q = self.network.select('high_critic')(n_enc_observations, goals=n_enc_goals, actions=n_subgoals).min(axis=0)
         subgoals = n_subgoals[jnp.argmax(q)]
 
         # Low-level: behavioral cloning.
         # Optionally condition on the final goal as well
         if self.config['low_actor_goal_conditioned']:
-            if self.config['encode_goal']:
+            if self.config['separate_goal_subgoal_latent']:
+                low_actor_goals = jnp.concatenate([subgoals, enc_goals], axis=-1)
+            elif self.config['shared_goal_subgoal_latent']:
+                low_actor_goals = jnp.concatenate([subgoals, enc_goals], axis=-1)
+            elif self.config['encode_goal']:
                 encoded_goal = self.network.select('goal_encoder')(goals)
                 low_actor_goals = jnp.concatenate([subgoals, encoded_goal], axis=-1)
             else:
@@ -531,6 +665,11 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_goals = example_batch['high_actor_goals']
+        ex_goal_observations = (
+            example_batch['high_actor_goal_observations']
+            if 'high_actor_goal_observations' in example_batch
+            else ex_goals
+        )
         batch_size = ex_observations.shape[0]
         ex_times = np.zeros((batch_size, 1), dtype=np.float32)  # Always (batch, 1) for flow timesteps
         ex_z = np.zeros((batch_size, config['z_dim']), dtype=np.float32)
@@ -544,6 +683,25 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             action_dim = ex_actions.shape[-1]
         goal_dim = ex_goals.shape[-1]
         obs_dim = ex_observations.shape[-1]
+        if config['shared_goal_subgoal_latent'] and config['separate_goal_subgoal_latent']:
+            raise ValueError('shared_goal_subgoal_latent and separate_goal_subgoal_latent cannot both be True.')
+        if config['learn_oracle_goal_encoder'] and not (
+            config['shared_goal_subgoal_latent'] or config['separate_goal_subgoal_latent']
+        ):
+            raise ValueError(
+                'learn_oracle_goal_encoder=True requires shared_goal_subgoal_latent=True '
+                'or separate_goal_subgoal_latent=True.'
+            )
+        if config['shared_goal_subgoal_latent'] and not config['learn_oracle_goal_encoder'] and goal_dim != obs_dim:
+            raise ValueError(
+                'shared_goal_subgoal_latent=True requires learn_oracle_goal_encoder=True when '
+                'goal_dim != obs_dim (e.g., oracle-rep datasets).'
+            )
+        if config['separate_goal_subgoal_latent'] and not config['learn_oracle_goal_encoder'] and goal_dim != obs_dim:
+            raise ValueError(
+                'separate_goal_subgoal_latent=True requires learn_oracle_goal_encoder=True when '
+                'goal_dim != obs_dim (e.g., oracle-rep datasets).'
+            )
         mlp_hidden_dims = (config['mlp_hidden_dim'],) * config['mlp_num_layers']
 
         # Define networks.
@@ -599,13 +757,13 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             encoder_def = encoder_module()
             enc_shape_params = encoder_def.init(enc_shape_rng, ex_observations)['params']
             ex_enc = encoder_def.apply({'params': enc_shape_params}, ex_observations)
+            ex_enc_goal_observations = encoder_def.apply({'params': enc_shape_params}, ex_goal_observations)
             ex_enc_goals = encoder_def.apply({'params': enc_shape_params}, ex_goals)
-            enc_dim = ex_enc.shape[-1]
         else:
             encoder_def = None
             ex_enc = ex_observations
+            ex_enc_goal_observations = ex_goal_observations
             ex_enc_goals = ex_goals
-            enc_dim = obs_dim
 
         # Subgoal encoder: by default only s' -> z, optionally (s, s', g) -> z
         subgoal_encoder_def = SubgoalEncoder(
@@ -617,16 +775,34 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             z_dim=config['z_dim'],
         )
         # Build example input based on which components are enabled (all encoded)
-        subgoal_inputs = [ex_enc]  # s' always included (encoded)
+        subgoal_inputs = [ex_enc_goal_observations]  # s' (or goal observation) is always included (encoded)
         if config['use_subgoal_currstate']:
             subgoal_inputs.insert(0, ex_enc)  # prepend s (encoded)
         if config['use_subgoal_truegoal']:
             subgoal_inputs.append(ex_enc_goals)  # append g (encoded)
         ex_subgoal_input = np.concatenate(subgoal_inputs, axis=-1)
 
+        goal_latent_encoder_def = None
+        if config['separate_goal_subgoal_latent']:
+            goal_latent_encoder_def = GoalEncoder(
+                use_resmlp=config['use_resmlp'],
+                mlp_hidden_dims=mlp_hidden_dims,
+                layer_norm=config['layer_norm'],
+                resmlp_hidden_dim=config['resmlp_hidden_dim'],
+                resmlp_num_blocks=config['resmlp_num_blocks'],
+                output_dim=config['goal_z_dim'],
+            )
+            ex_goal_z = np.zeros((ex_observations.shape[0], config['goal_z_dim']), dtype=np.float32)
+        else:
+            ex_goal_z = None
+
         # Optionally create goal encoder for low actor goal conditioning
         goal_encoder_def = None
-        if config['low_actor_goal_conditioned'] and config['encode_goal']:
+        if config['low_actor_goal_conditioned'] and config['separate_goal_subgoal_latent']:
+            ex_low_actor_goal = np.concatenate([ex_z, ex_goal_z], axis=-1)
+        elif config['low_actor_goal_conditioned'] and config['shared_goal_subgoal_latent']:
+            ex_low_actor_goal = np.concatenate([ex_z, ex_z], axis=-1)
+        elif config['low_actor_goal_conditioned'] and config['encode_goal']:
             goal_encoder_def = GoalEncoder(
                 use_resmlp=config['use_resmlp'],
                 mlp_hidden_dims=mlp_hidden_dims,
@@ -643,6 +819,25 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         else:
             ex_low_actor_goal = ex_z
 
+        oracle_goal_encoder_def = None
+        if config['learn_oracle_goal_encoder']:
+            oracle_goal_output_dim = config['goal_z_dim'] if config['separate_goal_subgoal_latent'] else config['z_dim']
+            oracle_goal_encoder_def = GoalEncoder(
+                use_resmlp=config['use_resmlp'],
+                mlp_hidden_dims=mlp_hidden_dims,
+                layer_norm=config['layer_norm'],
+                resmlp_hidden_dim=config['resmlp_hidden_dim'],
+                resmlp_num_blocks=config['resmlp_num_blocks'],
+                output_dim=oracle_goal_output_dim,
+            )
+
+        if config['separate_goal_subgoal_latent']:
+            ex_high_goals = ex_goal_z
+        elif config['shared_goal_subgoal_latent']:
+            ex_high_goals = ex_z
+        else:
+            ex_high_goals = ex_enc_goals
+
         # Create discrete low actor if needed
         if config['discrete']:
             low_actor_def = GCDiscreteActor(
@@ -653,11 +848,13 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         # Networks now receive encoded observations and goals
         network_info = dict(
             subgoal_encoder=(subgoal_encoder_def, (ex_subgoal_input,)),
-            high_value=(high_value_def, (ex_enc, ex_enc_goals)),
-            high_critic=(high_critic_def, (ex_enc, ex_enc_goals, ex_z)),
-            target_high_critic=(copy.deepcopy(high_critic_def), (ex_enc, ex_enc_goals, ex_z)),
-            high_actor_flow=(high_actor_flow_def, (ex_enc, ex_enc_goals, ex_z, ex_times)),
+            high_value=(high_value_def, (ex_enc, ex_high_goals)),
+            high_critic=(high_critic_def, (ex_enc, ex_high_goals, ex_z)),
+            target_high_critic=(copy.deepcopy(high_critic_def), (ex_enc, ex_high_goals, ex_z)),
+            high_actor_flow=(high_actor_flow_def, (ex_enc, ex_high_goals, ex_z, ex_times)),
         )
+        if config['oracle_critic_distill']:
+            network_info['oracle_high_critic'] = (copy.deepcopy(high_critic_def), (ex_enc, ex_enc_goals, ex_z))
         # Add either discrete or continuous low actor
         if config['discrete']:
             network_info['low_actor'] = (low_actor_def, (ex_enc, ex_low_actor_goal))
@@ -667,6 +864,10 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             network_info['encoder'] = (encoder_def, (ex_observations,))
         if goal_encoder_def is not None:
             network_info['goal_encoder'] = (goal_encoder_def, (ex_goals,))
+        if goal_latent_encoder_def is not None:
+            network_info['goal_latent_encoder'] = (goal_latent_encoder_def, (ex_enc_goal_observations,))
+        if oracle_goal_encoder_def is not None:
+            network_info['oracle_goal_encoder'] = (oracle_goal_encoder_def, (ex_goals,))
 
         # Probe networks for diagnostic analysis of z
         if config['use_probe']:
@@ -717,6 +918,14 @@ def get_config():
             encoder='none',  # Encoder name ('none' for no encoder, or e.g., 'resmlp_small').
             freeze_encoder=True,  # Whether to freeze encoder weights (if encoder is used).
             high_actor_warmup_steps=0,  # Steps to freeze high actor (0 = no warmup).
+            shared_goal_subgoal_latent=False,  # Use shared latent space for high-level goals and subgoals.
+            separate_goal_subgoal_latent=False,  # Use separate goal latent and subgoal latent spaces.
+            goal_z_dim=8,  # Goal latent dimension when separate_goal_subgoal_latent=True.
+            learn_oracle_goal_encoder=False,  # Learn oracle-goal -> shared-latent mapping for oracle-rep goals.
+            oracle_goal_encoder_coef=1.0,  # Coefficient for oracle-goal distillation loss.
+            oracle_critic_distill=False,  # Distill oracle-goal critic Q(s, oracle, z) from teacher Q(s, z_goal, z).
+            oracle_critic_distill_coef=1.0,  # Coefficient for oracle critic distillation loss.
+            oracle_critic_use_for_inference=True,  # Use oracle critic for rejection sampling if available.
             low_actor_goal_conditioned=False,  # Whether low actor sees the final goal in addition to z.
             encode_goal=False,  # Whether to encode the goal before passing to low actor.
             goal_encoder_output_dim=64,  # Output dimension of goal encoder.
