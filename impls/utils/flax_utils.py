@@ -199,6 +199,7 @@ def restore_agent(agent, restore_path, restore_epoch):
     agent = flax.serialization.from_state_dict(agent, load_dict['agent'])
 
     print(f'Restored from {restore_path}')
+    return agent
 
 
 def save_pretrain_state(state, target_params, save_dir, step, prefix='pretrain'):
