@@ -44,47 +44,134 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             return self.network.select('subgoal_encoder')(midpoint_observations)
         return self.network.select('subgoal_encoder')(midpoint_observations, params=grad_params)
 
+    def _use_hybrid_state_midpoint(self):
+        cutoff = self.config['hybrid_state_midpoint_max_offset']
+        return cutoff is not None and cutoff >= 0
+
+    def _hybrid_short_mask(self, batch):
+        return (batch['value_midpoint_offsets'] <= self.config['hybrid_state_midpoint_max_offset'])[None, ...]
+
     @staticmethod
     def bce_loss(pred_logit, target):
         log_pred = jax.nn.log_sigmoid(pred_logit)
         log_not_pred = jax.nn.log_sigmoid(-pred_logit)
         return -(log_pred * target + log_not_pred * (1 - target))
 
+    def _aggregate_q_ensembles(self, values):
+        if self.config['q_agg'] == 'min':
+            return jnp.minimum(values[0], values[1])
+        if self.config['q_agg'] == 'mean':
+            return values.mean(axis=0)
+        raise ValueError(f"Unsupported q_agg: {self.config['q_agg']}")
+
     def q_loss(self, batch, grad_params):
-        """Train Q(s, z_mid, g) using the midpoint triangle target."""
+        """Train Q with optional short-horizon state-midpoint fallback.
+
+        Core latent TRL target: Q(s, z_mid, g) <- V(s, z_mid) * V(z_mid, g),
+        where z_mid = enc(s_mid).
+        """
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
         midpoint_goal_key = 'value_midpoint_observations' if self.config['oracle_distill'] else 'value_midpoint_goals'
 
         z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params=grad_params)
-        q_logits = self.network.select('q')(
+        q_latent_logits = self.network.select('q')(
             batch['observations'],
             goals=batch[goal_key],
             actions=z_mid,
             params=grad_params,
         )
+        q_logits = q_latent_logits
+        q_state = None
+        if self._use_hybrid_state_midpoint():
+            q_state_logits = self.network.select('q_state')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=batch['value_midpoint_observations'],
+                params=grad_params,
+            )
+            short_mask = self._hybrid_short_mask(batch)
+            q_logits = jnp.where(short_mask, q_state_logits, q_latent_logits)
+            q_state = jax.nn.sigmoid(q_state_logits)
         qs = jax.nn.sigmoid(q_logits)
 
-        first_v_logits = self.network.select('target_value')(
+        second_offset = batch['value_offsets'][None, ...] - batch['value_midpoint_offsets']
+        z_mid_target = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_mid_target = jax.lax.stop_gradient(z_mid_target)
+
+        # State-space factors (teacher values over concrete midpoint state s').
+        state_first_v_logits = self.network.select('target_value')(
             batch['observations'],
             goals=batch[midpoint_goal_key],
         )
+        state_second_v_logits = self.network.select('target_value')(
+            batch['value_midpoint_observations'],
+            goals=batch[goal_key],
+        )
+
+        # Latent factors V(s, z) and V(z, g). Use the same latent-target choice as alt Bellman.
+        if self.config['alt_bellman_use_target_latent_values']:
+            latent_first_v_logits = self.network.select('target_value_sz')(
+                batch['observations'],
+                goals=z_mid_target,
+            )
+            latent_second_v_logits = self.network.select('target_value_zg')(
+                z_mid_target,
+                goals=batch[goal_key],
+            )
+        else:
+            latent_first_v_logits = self.network.select('value_sz')(
+                batch['observations'],
+                goals=z_mid_target,
+                params=grad_params,
+            )
+            latent_second_v_logits = self.network.select('value_zg')(
+                z_mid_target,
+                goals=batch[goal_key],
+                params=grad_params,
+            )
+
+        if self.config['alt_bellman_backup']:
+            first_v_logits = latent_first_v_logits
+            second_v_logits = latent_second_v_logits
+        else:
+            first_v_logits = state_first_v_logits
+            second_v_logits = state_second_v_logits
+
         first_v = jnp.where(
             (batch['value_midpoint_offsets'] <= 1)[None, ...],
             self.config['discount'] ** batch['value_midpoint_offsets'][None, ...],
             jax.nn.sigmoid(first_v_logits),
         )
-
-        second_v_logits = self.network.select('target_value')(
-            batch['value_midpoint_observations'],
-            goals=batch[goal_key],
-        )
-        second_offset = batch['value_offsets'][None, ...] - batch['value_midpoint_offsets']
         second_v = jnp.where(
             (second_offset <= 1)[None, ...],
             self.config['discount'] ** second_offset[None, ...],
             jax.nn.sigmoid(second_v_logits),
         )
         target = first_v * second_v
+
+        # Single-sample covariance residual estimator:
+        # (V(s,s') - V(s,z)) * (V(s',g) - V(z,g))
+        state_first_v = jnp.where(
+            (batch['value_midpoint_offsets'] <= 1)[None, ...],
+            self.config['discount'] ** batch['value_midpoint_offsets'][None, ...],
+            jax.nn.sigmoid(state_first_v_logits),
+        )
+        state_second_v = jnp.where(
+            (second_offset <= 1),
+            self.config['discount'] ** second_offset,
+            jax.nn.sigmoid(state_second_v_logits),
+        )
+        latent_first_v = jax.nn.sigmoid(latent_first_v_logits)
+        latent_second_v = jax.nn.sigmoid(latent_second_v_logits)
+
+        state_first_scalar = self._aggregate_q_ensembles(state_first_v)
+        state_second_scalar = self._aggregate_q_ensembles(state_second_v)
+        latent_first_scalar = self._aggregate_q_ensembles(latent_first_v)
+        latent_second_scalar = self._aggregate_q_ensembles(latent_second_v)
+
+        cov_point_estimate = (state_first_scalar - latent_first_scalar) * (
+            state_second_scalar - latent_second_scalar
+        )
 
         dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
@@ -97,7 +184,20 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'q_mean': qs.mean(),
             'q_max': qs.max(),
             'q_min': qs.min(),
+            'first_factor_mean': first_v.mean(),
+            'second_factor_mean': second_v.mean(),
+            'cov_point_estimate_mean': cov_point_estimate.mean(),
+            'cov_point_estimate_min': cov_point_estimate.min(),
+            'cov_point_estimate_max': cov_point_estimate.max(),
+            'alt_bellman_backup': jnp.asarray(float(self.config['alt_bellman_backup']), dtype=jnp.float32),
+            'alt_bellman_use_target_latent_values': jnp.asarray(
+                float(self.config['alt_bellman_use_target_latent_values']), dtype=jnp.float32
+            ),
         }
+        if self._use_hybrid_state_midpoint():
+            info['short_frac'] = self._hybrid_short_mask(batch).mean()
+            info['q_latent_mean'] = jax.nn.sigmoid(q_latent_logits).mean()
+            info['q_state_mean'] = q_state.mean()
 
         if self.config['oracle_distill']:
             oracle_q_logits = self.network.select('oracle_q')(
@@ -129,18 +229,24 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
         z_mid = jax.lax.stop_gradient(z_mid)
-        q_logits = self.network.select('target_q')(
+        q_latent_logits = self.network.select('target_q')(
             batch['observations'],
             goals=batch[goal_key],
             actions=z_mid,
         )
+        q_logits = q_latent_logits
+        q_state = None
+        if self._use_hybrid_state_midpoint():
+            q_state_logits = self.network.select('target_q_state')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=batch['value_midpoint_observations'],
+            )
+            short_mask = self._hybrid_short_mask(batch)
+            q_logits = jnp.where(short_mask, q_state_logits, q_latent_logits)
+            q_state = jax.nn.sigmoid(q_state_logits)
         q = jax.nn.sigmoid(q_logits)
-        if self.config['q_agg'] == 'min':
-            target = jnp.minimum(q[0], q[1])
-        elif self.config['q_agg'] == 'mean':
-            target = q.mean(axis=0)
-        else:
-            raise ValueError(f"Unsupported q_agg: {self.config['q_agg']}")
+        target = self._aggregate_q_ensembles(q)
 
         expectile_weight = jnp.where(
             target >= vs,
@@ -157,7 +263,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         actual_steps = batch['value_offsets']
         relative_gap = (predicted_steps - actual_steps) / (actual_steps + 1e-8)
 
-        return total_loss, {
+        info = {
             'total_loss': total_loss,
             'v_loss': v_loss.mean(),
             'v_mean': vs.mean(),
@@ -165,6 +271,91 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'v_min': vs.min(),
             'calibration_rel_gap_mean': relative_gap.mean(),
             'calibration_rel_gap_max': relative_gap.max(),
+        }
+        if self._use_hybrid_state_midpoint():
+            info['short_frac'] = self._hybrid_short_mask(batch).mean()
+            info['q_target_latent_mean'] = jax.nn.sigmoid(q_latent_logits).mean()
+            info['q_target_state_mean'] = q_state.mean()
+        return total_loss, info
+
+    def value_sz_loss(self, batch, grad_params):
+        """Distill V(s, z_mid) from V(s, s_mid) to test V(s, z) viability."""
+        midpoint_goal_key = 'value_midpoint_observations' if self.config['oracle_distill'] else 'value_midpoint_goals'
+        subgoal_grad_params = None if self.config['value_sz_stopgrad_encoder'] else grad_params
+        z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params=subgoal_grad_params)
+
+        v_teacher_logits = self.network.select('value')(
+            batch['observations'],
+            goals=batch[midpoint_goal_key],
+            params=grad_params,
+        )
+        v_teacher = jax.nn.sigmoid(v_teacher_logits)
+        v_teacher_target = self._aggregate_q_ensembles(v_teacher)
+        v_teacher_metric = v_teacher_target
+
+        v_sz_logits = self.network.select('value_sz')(
+            batch['observations'],
+            goals=z_mid,
+            params=grad_params,
+        )
+        v_sz = jax.nn.sigmoid(v_sz_logits)
+        v_sz_metric = self._aggregate_q_ensembles(v_sz)
+
+        target = jax.lax.stop_gradient(v_teacher_target)
+        distill_loss = self.bce_loss(v_sz_logits, target[None, ...]).mean()
+
+        z_norms = jnp.linalg.norm(z_mid, axis=-1)
+        return distill_loss, {
+            'distill_loss': distill_loss,
+            'v_teacher_mean': v_teacher_metric.mean(),
+            'v_teacher_max': v_teacher_metric.max(),
+            'v_teacher_min': v_teacher_metric.min(),
+            'v_sz_mean': v_sz_metric.mean(),
+            'v_sz_max': v_sz_metric.max(),
+            'v_sz_min': v_sz_metric.min(),
+            'vsz_abs_err': jnp.abs(v_sz_metric - v_teacher_metric).mean(),
+            'z_norm_mean': z_norms.mean(),
+            'z_norm_std': z_norms.std(),
+        }
+
+    def value_zg_loss(self, batch, grad_params):
+        """Distill V(z_mid, g) from teacher V(s_mid, g)."""
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        subgoal_grad_params = None if self.config['value_zg_stopgrad_encoder'] else grad_params
+        z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params=subgoal_grad_params)
+
+        v_teacher_logits = self.network.select('value')(
+            batch['value_midpoint_observations'],
+            goals=batch[goal_key],
+            params=grad_params,
+        )
+        v_teacher = jax.nn.sigmoid(v_teacher_logits)
+        v_teacher_target = self._aggregate_q_ensembles(v_teacher)
+        v_teacher_metric = v_teacher_target
+
+        v_zg_logits = self.network.select('value_zg')(
+            z_mid,
+            goals=batch[goal_key],
+            params=grad_params,
+        )
+        v_zg = jax.nn.sigmoid(v_zg_logits)
+        v_zg_metric = self._aggregate_q_ensembles(v_zg)
+
+        target = jax.lax.stop_gradient(v_teacher_target)
+        distill_loss = self.bce_loss(v_zg_logits, target[None, ...]).mean()
+
+        z_norms = jnp.linalg.norm(z_mid, axis=-1)
+        return distill_loss, {
+            'distill_loss': distill_loss,
+            'v_teacher_mean': v_teacher_metric.mean(),
+            'v_teacher_max': v_teacher_metric.max(),
+            'v_teacher_min': v_teacher_metric.min(),
+            'v_zg_mean': v_zg_metric.mean(),
+            'v_zg_max': v_zg_metric.max(),
+            'v_zg_min': v_zg_metric.min(),
+            'vzg_abs_err': jnp.abs(v_zg_metric - v_teacher_metric).mean(),
+            'z_norm_mean': z_norms.mean(),
+            'z_norm_std': z_norms.std(),
         }
 
     def q_short_loss(self, batch, grad_params):
@@ -288,9 +479,9 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
     def total_loss(self, batch, grad_params, rng=None):
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, value_rng, q_rng, q_short_rng, actor_rng = jax.random.split(rng, 5)
+        rng, value_rng, q_rng, value_sz_rng, value_zg_rng, q_short_rng, actor_rng = jax.random.split(rng, 7)
 
-        del value_rng, q_rng, q_short_rng  # deterministic losses in this minimal implementation
+        del value_rng, q_rng, value_sz_rng, value_zg_rng, q_short_rng  # deterministic losses in this minimal impl.
 
         value_loss, value_info = self.value_loss(batch, grad_params)
         for k, v in value_info.items():
@@ -300,6 +491,16 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         for k, v in q_info.items():
             info[f'q/{k}'] = v
 
+        value_sz_loss, value_sz_info = self.value_sz_loss(batch, grad_params)
+        for k, v in value_sz_info.items():
+            info[f'value_sz/{k}'] = v
+
+        value_zg_loss = 0.0
+        if self.config['value_zg_coef'] > 0:
+            value_zg_loss, value_zg_info = self.value_zg_loss(batch, grad_params)
+            for k, v in value_zg_info.items():
+                info[f'value_zg/{k}'] = v
+
         q_short_loss, q_short_info = self.q_short_loss(batch, grad_params)
         for k, v in q_short_info.items():
             info[f'q_short/{k}'] = v
@@ -308,7 +509,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = value_loss + q_loss + q_short_loss + actor_loss
+        loss = (
+            value_loss
+            + q_loss
+            + self.config['value_sz_coef'] * value_sz_loss
+            + self.config['value_zg_coef'] * value_zg_loss
+            + q_short_loss
+            + actor_loss
+        )
         return loss, info
 
     def target_update(self, network, module_name, tau=None):
@@ -329,7 +537,10 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'value')
+        self.target_update(new_network, 'value_sz')
+        self.target_update(new_network, 'value_zg')
         self.target_update(new_network, 'q')
+        self.target_update(new_network, 'q_state')
         if self.config['oracle_distill']:
             self.target_update(new_network, 'oracle_q')
 
@@ -413,7 +624,22 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
+        value_sz_def = GCValue(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            num_ensembles=2,
+        )
+        value_zg_def = GCValue(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            num_ensembles=2,
+        )
         q_def = GCValue(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            num_ensembles=2,
+        )
+        q_state_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=2,
@@ -459,8 +685,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             subgoal_encoder=(subgoal_encoder_def, (ex_mid_obs,)),
             value=(value_def, (ex_observations, ex_value_goals)),
             target_value=(copy.deepcopy(value_def), (ex_observations, ex_value_goals)),
+            value_sz=(value_sz_def, (ex_observations, ex_z)),
+            target_value_sz=(copy.deepcopy(value_sz_def), (ex_observations, ex_z)),
+            value_zg=(value_zg_def, (ex_z, ex_value_goals)),
+            target_value_zg=(copy.deepcopy(value_zg_def), (ex_z, ex_value_goals)),
             q=(q_def, (ex_observations, ex_value_goals, ex_z)),
             target_q=(copy.deepcopy(q_def), (ex_observations, ex_value_goals, ex_z)),
+            q_state=(q_state_def, (ex_observations, ex_value_goals, ex_mid_obs)),
+            target_q_state=(copy.deepcopy(q_state_def), (ex_observations, ex_value_goals, ex_mid_obs)),
             q_short=(q_short_def, (ex_observations, ex_goals, ex_actions)),
             actor=(actor_def, ex_actor_in),
         )
@@ -483,7 +715,10 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         params = network_params
         params['modules_target_value'] = params['modules_value']
+        params['modules_target_value_sz'] = params['modules_value_sz']
+        params['modules_target_value_zg'] = params['modules_value_zg']
         params['modules_target_q'] = params['modules_q']
+        params['modules_target_q_state'] = params['modules_q_state']
         if config['oracle_distill']:
             params['modules_target_oracle_q'] = params['modules_oracle_q']
 
@@ -508,6 +743,13 @@ def get_config():
             oracle_q_distill_coef=1.0,
             q_agg='min',
             z_dim=8,
+            value_sz_coef=1.0,
+            value_sz_stopgrad_encoder=True,
+            value_zg_coef=0.0,
+            value_zg_stopgrad_encoder=True,
+            alt_bellman_backup=False,
+            alt_bellman_use_target_latent_values=True,
+            hybrid_state_midpoint_max_offset=-1,
             pe_type='frs',  # frs, rpg, discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

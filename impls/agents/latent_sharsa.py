@@ -13,7 +13,7 @@ from utils.networks import ActorVectorField, GCValue, MLP
 
 
 class LatentSHARSAAgent(flax.struct.PyTreeNode):
-    """Minimal latent SHARSA agent for the current baseline code path."""
+    """Latent SHARSA agent with V(z, g) distilled from V(s, g)."""
 
     rng: Any
     network: Any
@@ -34,7 +34,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         return self.network.select('subgoal_encoder')(next_observations, params=grad_params)
 
     def high_value_loss(self, batch, grad_params):
-        """Compute the high-level SARSA value loss."""
+        """Train primary V(s, g) from Q(s, z, g) with z = enc(s')."""
         z_target = self._encode_subgoal(batch['high_value_next_observations'], grad_params)
         z_target = jax.lax.stop_gradient(z_target)
 
@@ -70,10 +70,11 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             'v_mean': v.mean(),
             'v_max': v.max(),
             'v_min': v.min(),
+            'vq_abs_err': jnp.abs(v - q).mean(),
         }
 
     def high_critic_loss(self, batch, grad_params):
-        """Compute the high-level SARSA critic loss."""
+        """Compute Q(s, z, g) Bellman targets using primary V(s, g)."""
         next_v = self.network.select('high_value')(
             batch['high_value_next_observations'],
             batch['high_value_goals'],
@@ -106,6 +107,53 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             'q_mean': q.mean(),
             'q_max': q.max(),
             'q_min': q.min(),
+            'next_v_mean': next_v.mean(),
+            'next_v_max': next_v.max(),
+            'next_v_min': next_v.min(),
+            'z_norm_mean': z_norms.mean(),
+            'z_norm_std': z_norms.std(),
+        }
+
+    def high_value_z_distill_loss(self, batch, grad_params):
+        """Distill V(z, g) from stop-gradient V(s, g) teacher."""
+        subgoal_grad_params = None if self.config['value_z_stopgrad_encoder'] else grad_params
+        z_obs = self._encode_subgoal(batch['observations'], subgoal_grad_params)
+
+        v_state = self.network.select('high_value')(
+            batch['observations'],
+            batch['high_value_goals'],
+            params=grad_params,
+        )
+        v_z = self.network.select('high_value_z')(
+            z_obs,
+            batch['high_value_goals'],
+            params=grad_params,
+        )
+
+        if self.config['value_loss_type'] == 'squared':
+            target = jax.lax.stop_gradient(v_state)
+            distill_loss = ((v_z - target) ** 2).mean()
+            v_state_metric = v_state
+            v_z_metric = v_z
+        elif self.config['value_loss_type'] == 'bce':
+            v_state_metric = jax.nn.sigmoid(v_state)
+            v_z_logit = v_z
+            v_z_metric = jax.nn.sigmoid(v_z_logit)
+            target = jax.lax.stop_gradient(v_state_metric)
+            distill_loss = self.bce_loss(v_z_logit, target).mean()
+        else:
+            raise ValueError(f"Unsupported value_loss_type: {self.config['value_loss_type']}")
+
+        z_norms = jnp.linalg.norm(z_obs, axis=-1)
+        return distill_loss, {
+            'distill_loss': distill_loss,
+            'v_state_mean': v_state_metric.mean(),
+            'v_state_max': v_state_metric.max(),
+            'v_state_min': v_state_metric.min(),
+            'v_z_mean': v_z_metric.mean(),
+            'v_z_max': v_z_metric.max(),
+            'v_z_min': v_z_metric.min(),
+            'vz_vs_abs_err': jnp.abs(v_z_metric - v_state_metric).mean(),
             'z_norm_mean': z_norms.mean(),
             'z_norm_std': z_norms.std(),
         }
@@ -182,11 +230,15 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         for k, v in high_critic_info.items():
             info[f'high_critic/{k}'] = v
 
+        high_value_z_loss, high_value_z_info = self.high_value_z_distill_loss(batch, grad_params)
+        for k, v in high_value_z_info.items():
+            info[f'high_value_z/{k}'] = v
+
         low_actor_loss, low_actor_info = self.low_actor_loss(batch, grad_params, low_actor_rng)
         for k, v in low_actor_info.items():
             info[f'low_actor/{k}'] = v
 
-        loss = high_value_loss + high_critic_loss + low_actor_loss
+        loss = high_value_loss + high_critic_loss + self.config['value_z_coef'] * high_value_z_loss + low_actor_loss
 
         def add_high_actor_loss():
             ha_loss, ha_info = self.high_actor_loss(batch, grad_params, high_actor_rng)
@@ -343,6 +395,11 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=1,
         )
+        high_value_z_def = GCValue(
+            hidden_dims=mlp_hidden_dims,
+            layer_norm=config['layer_norm'],
+            num_ensembles=1,
+        )
         high_critic_def = GCValue(
             hidden_dims=mlp_hidden_dims,
             layer_norm=config['layer_norm'],
@@ -362,6 +419,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         network_info = dict(
             subgoal_encoder=(subgoal_encoder_def, (ex_observations,)),
             high_value=(high_value_def, (ex_observations, ex_goals)),
+            high_value_z=(high_value_z_def, (ex_z, ex_goals)),
             high_critic=(high_critic_def, (ex_observations, ex_goals, ex_z)),
             target_high_critic=(copy.deepcopy(high_critic_def), (ex_observations, ex_goals, ex_z)),
             high_actor_flow=(high_actor_flow_def, (ex_observations, ex_goals, ex_z, ex_times)),
@@ -403,7 +461,9 @@ def get_config():
             flow_steps=10,  # Number of flow steps.
             num_samples=32,  # Number of samples for high-level rejection sampling.
             high_actor_warmup_steps=0,  # Steps to freeze high actor (0 = no warmup).
-            policy_subgoal_stopgrad=False,  # Whether to stop policy gradients into subgoal encoder.
+            policy_subgoal_stopgrad=True,  # Whether to stop policy gradients into subgoal encoder.
+            value_z_coef=1.0,  # Coefficient for distilling V(z, g) from V(s, g).
+            value_z_stopgrad_encoder=True,  # Whether to stop distill gradients into the subgoal encoder.
             low_actor_goal_conditioned=False,  # Whether low actor sees final goal in addition to z.
             discrete=False,  # Unsupported in minimal latent SHARSA; kept for config compatibility.
             # Dataset hyperparameters.
