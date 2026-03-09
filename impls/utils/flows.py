@@ -164,6 +164,7 @@ def imf_loss(
     adaptive_loss: bool = True,
     adaptive_loss_eps: float = 0.01,
     adaptive_loss_p: float = 1.0,
+    mask: Optional[jax.Array] = None,
 ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
     """iMF loss without classifier-free guidance (CFG).
 
@@ -241,7 +242,10 @@ def imf_loss(
             loss_v = _adaptive_loss_weight(loss_v, eps=adaptive_loss_eps, p=adaptive_loss_p)
         loss = loss + loss_v
 
-    loss = jnp.mean(loss)
+    if mask is not None:
+        loss = jnp.sum(loss * mask) / jnp.maximum(mask.sum(), 1.0)
+    else:
+        loss = jnp.mean(loss)
 
     info = {
         'loss': loss,

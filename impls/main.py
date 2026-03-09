@@ -201,7 +201,7 @@ def main(_):
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
         # Pass step to agents that support it (e.g., for warmup schedules)
-        if 'high_actor_warmup_steps' in config:
+        if 'high_actor_warmup_steps' in config or 'cf_warmup_steps' in config or 'cf_burnin_steps' in config:
             agent, update_info = agent.update(batch, step=i)
         else:
             agent, update_info = agent.update(batch)
@@ -211,7 +211,7 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                if 'high_actor_warmup_steps' in config:
+                if 'high_actor_warmup_steps' in config or 'cf_warmup_steps' in config or 'cf_burnin_steps' in config:
                     _, val_info = agent.total_loss(val_batch, grad_params=None, step=i)
                 else:
                     _, val_info = agent.total_loss(val_batch, grad_params=None)

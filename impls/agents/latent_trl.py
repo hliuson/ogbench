@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
+from utils.flows import imf_loss, imf_one_shot_sample
 from utils.networks import ActorVectorField, GCActor, GCDiscreteActor, GCValue, MLP
 
 
@@ -17,7 +18,6 @@ class SubgoalEncoder(nn.Module):
     hidden_dims: Sequence[int]
     layer_norm: bool
     z_dim: int
-
     @nn.compact
     def __call__(self, x):
         return MLP((*self.hidden_dims, self.z_dim), activate_final=False, layer_norm=self.layer_norm)(x)
@@ -64,15 +64,23 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             return values.mean(axis=0)
         raise ValueError(f"Unsupported q_agg: {self.config['q_agg']}")
 
-    def q_loss(self, batch, grad_params):
+    def _has_cf_z_stitching(self, batch):
+        return 'value_goals_is_intraj' in batch and self.config['z_proposal_coef'] > 0
+
+    def q_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
         """Train Q with optional short-horizon state-midpoint fallback.
 
         Core latent TRL target: Q(s, z_mid, g) <- V(s, z_mid) * V(z_mid, g),
         where z_mid = enc(s_mid).
+
+        When counterfactual z-stitching is active, counterfactual samples use
+        z from the iMF proposal and a latent factored backup instead.
         """
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
         midpoint_goal_key = 'value_midpoint_observations' if self.config['oracle_distill'] else 'value_midpoint_goals'
+        has_cf = self._has_cf_z_stitching(batch)
 
+        # --- In-trajectory path (standard) ---
         z_mid = self._encode_subgoal(batch['value_midpoint_observations'], grad_params=grad_params)
         q_latent_logits = self.network.select('q')(
             batch['observations'],
@@ -92,7 +100,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             short_mask = self._hybrid_short_mask(batch)
             q_logits = jnp.where(short_mask, q_state_logits, q_latent_logits)
             q_state = jax.nn.sigmoid(q_state_logits)
-        qs = jax.nn.sigmoid(q_logits)
 
         second_offset = batch['value_offsets'][None, ...] - batch['value_midpoint_offsets']
         z_mid_target = self._encode_subgoal(batch['value_midpoint_observations'])
@@ -147,9 +154,42 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             self.config['discount'] ** second_offset[None, ...],
             jax.nn.sigmoid(second_v_logits),
         )
-        target = first_v * second_v
+        intraj_target = first_v * second_v
 
-        # Single-sample covariance residual estimator:
+        # --- Counterfactual path: z from proposal, latent backup ---
+        if has_cf:
+            is_intraj = batch['value_goals_is_intraj']  # (B,) float32
+            is_intraj_2d = is_intraj[None, ...]  # (1, B) for ensemble dim
+
+            z_cf = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_cf = jax.lax.stop_gradient(z_cf)
+
+            # Q prediction for cf samples
+            q_cf_logits = self.network.select('q')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=z_cf,
+                params=grad_params,
+            )
+
+            # Latent factored target for cf: V_sz(s, z_cf) * V_zg(z_cf, g)
+            cf_first_v_logits = self.network.select('target_value_sz')(
+                batch['observations'], goals=z_cf,
+            )
+            cf_second_v_logits = self.network.select('target_value_zg')(
+                z_cf, goals=batch[goal_key],
+            )
+            cf_target = jax.nn.sigmoid(cf_first_v_logits) * jax.nn.sigmoid(cf_second_v_logits)
+
+            # Blend: intraj keeps original, cf uses proposal-based
+            q_logits = jnp.where(is_intraj_2d, q_logits, q_cf_logits)
+            target = jnp.where(is_intraj_2d, intraj_target, cf_target)
+        else:
+            target = intraj_target
+
+        qs = jax.nn.sigmoid(q_logits)
+
+        # Single-sample covariance residual estimator (intraj only):
         # (V(s,s') - V(s,z)) * (V(s',g) - V(z,g))
         state_first_v = jnp.where(
             (batch['value_midpoint_offsets'] <= 1)[None, ...],
@@ -176,6 +216,10 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
         q_loss = dist_weight * self.bce_loss(q_logits, jax.lax.stop_gradient(target))
+        # Warmup: downweight cf samples' loss contribution.
+        if has_cf:
+            sample_weight = is_intraj_2d + (1.0 - is_intraj_2d) * cf_weight
+            q_loss = q_loss * sample_weight
         total_loss = q_loss.mean()
 
         info = {
@@ -194,8 +238,16 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 float(self.config['alt_bellman_use_target_latent_values']), dtype=jnp.float32
             ),
         }
+        if has_cf:
+            info['cf_target_mean'] = cf_target.mean()
+            info['cf_frac'] = (1.0 - is_intraj).mean()
         if self._use_hybrid_state_midpoint():
-            info['short_frac'] = self._hybrid_short_mask(batch).mean()
+            short_mask = self._hybrid_short_mask(batch)
+            if has_cf:
+                # Only report short_frac over intraj samples (cf have dummy offset=0).
+                info['short_frac'] = (short_mask * is_intraj_2d).sum() / jnp.maximum(is_intraj_2d.sum(), 1.0)
+            else:
+                info['short_frac'] = short_mask.mean()
             info['q_latent_mean'] = jax.nn.sigmoid(q_latent_logits).mean()
             info['q_state_mean'] = q_state.mean()
 
@@ -217,9 +269,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
 
         return total_loss, info
 
-    def value_loss(self, batch, grad_params):
-        """In-trajectory value target from midpoint latent subgoals only."""
+    def value_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
+        """Value loss with optional multi-z expectile from proposed z candidates."""
         goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        has_cf = self._has_cf_z_stitching(batch)
+
         v_logits = self.network.select('value')(
             batch['observations'],
             goals=batch[goal_key],
@@ -227,6 +281,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         )
         vs = jax.nn.sigmoid(v_logits)
 
+        # --- Trajectory midpoint Q target (standard path) ---
         z_mid = self._encode_subgoal(batch['value_midpoint_observations'])
         z_mid = jax.lax.stop_gradient(z_mid)
         q_latent_logits = self.network.select('target_q')(
@@ -245,8 +300,45 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             short_mask = self._hybrid_short_mask(batch)
             q_logits = jnp.where(short_mask, q_state_logits, q_latent_logits)
             q_state = jax.nn.sigmoid(q_state_logits)
-        q = jax.nn.sigmoid(q_logits)
-        target = self._aggregate_q_ensembles(q)
+        q_traj = jax.nn.sigmoid(q_logits)
+        target_traj = self._aggregate_q_ensembles(q_traj)
+
+        # --- Proposed z target (when z_proposal is enabled) ---
+        use_proposal = self.config['z_proposal_coef'] > 0
+        if use_proposal and has_cf:
+            is_intraj = batch['value_goals_is_intraj']
+
+            z_proposed = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_proposed = jax.lax.stop_gradient(z_proposed)
+
+            q_proposed_logits = self.network.select('target_q')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=z_proposed,
+            )
+            q_proposed = jax.nn.sigmoid(q_proposed_logits)
+            target_proposed = self._aggregate_q_ensembles(q_proposed)  # (B,)
+
+            # Intraj: max of traj midpoint and proposed z (proposal may find shortcut).
+            # CF: proposed z is the only valid target (traj midpoint is dummy).
+            intraj_target = jnp.maximum(target_traj, target_proposed)
+            cf_target_val = cf_weight * target_proposed
+            target = jnp.where(is_intraj, intraj_target, cf_target_val)
+        elif use_proposal:
+            # No cf goals, but proposal enabled (gen-midpoint ablation).
+            z_proposed = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_proposed = jax.lax.stop_gradient(z_proposed)
+
+            q_proposed_logits = self.network.select('target_q')(
+                batch['observations'],
+                goals=batch[goal_key],
+                actions=z_proposed,
+            )
+            q_proposed = jax.nn.sigmoid(q_proposed_logits)
+            target_proposed = self._aggregate_q_ensembles(q_proposed)
+            target = jnp.maximum(target_traj, target_proposed)
+        else:
+            target = target_traj
 
         expectile_weight = jnp.where(
             target >= vs,
@@ -256,24 +348,38 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
         v_loss = expectile_weight * dist_weight * self.bce_loss(v_logits, jax.lax.stop_gradient(target))
-
         total_loss = v_loss.mean()
 
         predicted_steps = jnp.log(vs + 1e-8) / jnp.log(self.config['discount'])
         actual_steps = batch['value_offsets']
-        relative_gap = (predicted_steps - actual_steps) / (actual_steps + 1e-8)
+        # Mask to intraj only: cf samples have value_offsets=0 which blows up the ratio.
+        if has_cf:
+            is_intraj_cal = batch['value_goals_is_intraj']  # (B,)
+            safe_actual = jnp.where(is_intraj_cal, actual_steps, 1.0)
+            relative_gap = (predicted_steps - safe_actual) / (safe_actual + 1e-8)
+            relative_gap = relative_gap * is_intraj_cal[None, ...]
+        else:
+            relative_gap = (predicted_steps - actual_steps) / (actual_steps + 1e-8)
 
         info = {
             'total_loss': total_loss,
-            'v_loss': v_loss.mean(),
+            'v_loss': total_loss,
             'v_mean': vs.mean(),
             'v_max': vs.max(),
             'v_min': vs.min(),
             'calibration_rel_gap_mean': relative_gap.mean(),
             'calibration_rel_gap_max': relative_gap.max(),
         }
+        if use_proposal:
+            info['q_proposed_mean'] = target_proposed.mean()
+            info['q_traj_mean'] = target_traj.mean()
         if self._use_hybrid_state_midpoint():
-            info['short_frac'] = self._hybrid_short_mask(batch).mean()
+            short_mask = self._hybrid_short_mask(batch)
+            if has_cf:
+                is_intraj_v = batch['value_goals_is_intraj']
+                info['short_frac'] = (short_mask * is_intraj_v[None, ...]).sum() / jnp.maximum(is_intraj_v.sum(), 1.0)
+            else:
+                info['short_frac'] = short_mask.mean()
             info['q_target_latent_mean'] = jax.nn.sigmoid(q_latent_logits).mean()
             info['q_target_state_mean'] = q_state.mean()
         return total_loss, info
@@ -302,7 +408,15 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         v_sz_metric = self._aggregate_q_ensembles(v_sz)
 
         target = jax.lax.stop_gradient(v_teacher_target)
-        distill_loss = self.bce_loss(v_sz_logits, target[None, ...]).mean()
+        per_sample_loss = self.bce_loss(v_sz_logits, target[None, ...])
+        # Mask to in-trajectory samples only (cf midpoints are dummy).
+        if self._has_cf_z_stitching(batch):
+            is_intraj = batch['value_goals_is_intraj']  # (B,)
+            per_sample_loss = per_sample_loss * is_intraj[None, ...]
+            intraj_count = jnp.maximum(is_intraj.sum(), 1.0)
+            distill_loss = per_sample_loss.sum() / (intraj_count * per_sample_loss.shape[0])
+        else:
+            distill_loss = per_sample_loss.mean()
 
         z_norms = jnp.linalg.norm(z_mid, axis=-1)
         return distill_loss, {
@@ -342,7 +456,15 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         v_zg_metric = self._aggregate_q_ensembles(v_zg)
 
         target = jax.lax.stop_gradient(v_teacher_target)
-        distill_loss = self.bce_loss(v_zg_logits, target[None, ...]).mean()
+        per_sample_loss = self.bce_loss(v_zg_logits, target[None, ...])
+        # Mask to in-trajectory samples only (cf midpoints are dummy).
+        if self._has_cf_z_stitching(batch):
+            is_intraj = batch['value_goals_is_intraj']  # (B,)
+            per_sample_loss = per_sample_loss * is_intraj[None, ...]
+            intraj_count = jnp.maximum(is_intraj.sum(), 1.0)
+            distill_loss = per_sample_loss.sum() / (intraj_count * per_sample_loss.shape[0])
+        else:
+            distill_loss = per_sample_loss.mean()
 
         z_norms = jnp.linalg.norm(z_mid, axis=-1)
         return distill_loss, {
@@ -357,6 +479,77 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             'z_norm_mean': z_norms.mean(),
             'z_norm_std': z_norms.std(),
         }
+
+    def z_proposal_loss(self, batch, grad_params, rng):
+        """Train iMF z-proposal network: f(noise; s, g) -> z, supervised by enc(s_mid).
+
+        Only trains on in-trajectory samples (where a valid midpoint exists).
+        """
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+
+        z_target = self._encode_subgoal(batch['value_midpoint_observations'])
+        z_target = jax.lax.stop_gradient(z_target)
+
+        observations = batch['observations']
+        goals = batch[goal_key]
+
+        def vector_field_fn(noise, times):
+            return self.network.select('z_proposal')(
+                observations, goals=goals, actions=noise, times=times,
+                params=grad_params,
+            )
+
+        # Mask to in-trajectory samples only (cf midpoint targets are garbage).
+        intraj_mask = batch.get('value_goals_is_intraj', None)
+
+        loss, flow_info = imf_loss(
+            rng, z_target, vector_field_fn,
+            r_equals_t_prob=0.5,
+            mask=intraj_mask,
+        )
+
+        info = {'loss': loss}
+        if intraj_mask is not None:
+            info['intraj_frac'] = intraj_mask.mean()
+
+        for k, v in flow_info.items():
+            if k != 'loss':
+                info[k] = v
+
+        return loss, info
+
+    def _sample_z_proposal(self, batch, rng, num_samples=1):
+        """Sample z candidates from the z-proposal network via iMF one-shot."""
+        goal_key = 'value_goal_observations' if self.config['oracle_distill'] else 'value_goals'
+        observations = batch['observations']
+        goals = batch[goal_key]
+        z_dim = self.config['z_dim']
+
+        if num_samples == 1:
+            sample_shape = (observations.shape[0], z_dim)
+        else:
+            sample_shape = (num_samples, observations.shape[0], z_dim)
+
+        def vector_field_fn(noise, times):
+            if num_samples == 1:
+                return self.network.select('z_proposal')(
+                    observations, goals=goals, actions=noise, times=times,
+                )
+            else:
+                # Broadcast observations/goals to match (num_samples, batch, ...)
+                obs_bc = jnp.broadcast_to(observations[None], (num_samples, *observations.shape))
+                goals_bc = jnp.broadcast_to(goals[None], (num_samples, *goals.shape))
+                obs_flat = obs_bc.reshape(-1, observations.shape[-1])
+                goals_flat = goals_bc.reshape(-1, goals.shape[-1])
+                noise_flat = noise.reshape(-1, z_dim)
+                times_flat = times.reshape(-1, times.shape[-1])
+                out = self.network.select('z_proposal')(
+                    obs_flat, goals=goals_flat, actions=noise_flat, times=times_flat,
+                )
+                return out.reshape(num_samples, observations.shape[0], z_dim)
+
+        z_samples = imf_one_shot_sample(rng, sample_shape, vector_field_fn)
+        return z_samples
 
     def q_short_loss(self, batch, grad_params):
         """Distill Q_short(s, g, a) from gamma * V(s', g) for FRS action selection."""
@@ -476,18 +669,34 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         raise ValueError(f"Unsupported pe_type: {self.config['pe_type']}")
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, step=0):
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, value_rng, q_rng, value_sz_rng, value_zg_rng, q_short_rng, actor_rng = jax.random.split(rng, 7)
+        rng, value_rng, q_rng, value_sz_rng, value_zg_rng, q_short_rng, actor_rng, z_proposal_rng = (
+            jax.random.split(rng, 8)
+        )
 
-        del value_rng, q_rng, value_sz_rng, value_zg_rng, q_short_rng  # deterministic losses in this minimal impl.
+        del value_sz_rng, value_zg_rng, q_short_rng  # deterministic losses
 
-        value_loss, value_info = self.value_loss(batch, grad_params)
+        # Compute cf warmup weight: 0 during burn-in, then ramp 0 → 1 linearly.
+        cf_burnin_steps = self.config.get('cf_burnin_steps', 0)
+        cf_warmup_steps = self.config.get('cf_warmup_steps', 0)
+        if cf_burnin_steps > 0 or cf_warmup_steps > 0:
+            ramp_progress = jnp.maximum(step - cf_burnin_steps, 0)
+            cf_weight = jnp.where(
+                cf_warmup_steps > 0,
+                jnp.minimum(ramp_progress / cf_warmup_steps, 1.0),
+                jnp.where(step >= cf_burnin_steps, 1.0, 0.0),
+            )
+        else:
+            cf_weight = 1.0
+        info['cf_weight'] = jnp.asarray(cf_weight, dtype=jnp.float32)
+
+        value_loss, value_info = self.value_loss(batch, grad_params, rng=value_rng, cf_weight=cf_weight)
         for k, v in value_info.items():
             info[f'value/{k}'] = v
 
-        q_loss, q_info = self.q_loss(batch, grad_params)
+        q_loss, q_info = self.q_loss(batch, grad_params, rng=q_rng, cf_weight=cf_weight)
         for k, v in q_info.items():
             info[f'q/{k}'] = v
 
@@ -500,6 +709,12 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             value_zg_loss, value_zg_info = self.value_zg_loss(batch, grad_params)
             for k, v in value_zg_info.items():
                 info[f'value_zg/{k}'] = v
+
+        z_proposal_loss = 0.0
+        if self.config['z_proposal_coef'] > 0:
+            z_proposal_loss, z_proposal_info = self.z_proposal_loss(batch, grad_params, rng=z_proposal_rng)
+            for k, v in z_proposal_info.items():
+                info[f'z_proposal/{k}'] = v
 
         q_short_loss, q_short_info = self.q_short_loss(batch, grad_params)
         for k, v in q_short_info.items():
@@ -514,6 +729,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             + q_loss
             + self.config['value_sz_coef'] * value_sz_loss
             + self.config['value_zg_coef'] * value_zg_loss
+            + self.config['z_proposal_coef'] * z_proposal_loss
             + q_short_loss
             + actor_loss
         )
@@ -529,11 +745,11 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         network.params[f'modules_target_{module_name}'] = new_target_params
 
     @jax.jit
-    def update(self, batch):
+    def update(self, batch, step=0):
         new_rng, rng = jax.random.split(self.rng)
 
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, step=step)
 
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
         self.target_update(new_network, 'value')
@@ -655,6 +871,14 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             z_dim=config['z_dim'],
         )
 
+        # z-proposal: iMF flow conditioned on (s, g) outputting z candidates.
+        ex_z_times = jnp.zeros((ex_observations.shape[0], 5), dtype=ex_observations.dtype)  # iMF packs 5 time dims
+        z_proposal_def = ActorVectorField(
+            hidden_dims=config['actor_hidden_dims'],
+            action_dim=config['z_dim'],
+            layer_norm=config['layer_norm'],
+        )
+
         if config['pe_type'] == 'frs':
             actor_def = ActorVectorField(
                 hidden_dims=config['actor_hidden_dims'],
@@ -694,6 +918,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             q_state=(q_state_def, (ex_observations, ex_value_goals, ex_mid_obs)),
             target_q_state=(copy.deepcopy(q_state_def), (ex_observations, ex_value_goals, ex_mid_obs)),
             q_short=(q_short_def, (ex_observations, ex_goals, ex_actions)),
+            z_proposal=(z_proposal_def, (ex_observations, ex_value_goals, ex_z, ex_z_times)),
             actor=(actor_def, ex_actor_in),
         )
         if config['oracle_distill']:
@@ -750,6 +975,10 @@ def get_config():
             alt_bellman_backup=False,
             alt_bellman_use_target_latent_values=True,
             hybrid_state_midpoint_max_offset=-1,
+            z_proposal_coef=0.0,
+            cf_num_z_proposals=1,
+            cf_burnin_steps=0,
+            cf_warmup_steps=0,
             pe_type='frs',  # frs, rpg, discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

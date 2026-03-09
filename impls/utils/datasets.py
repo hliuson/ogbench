@@ -196,6 +196,13 @@ class GCDataset:
         assert np.isclose(
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
+        if self.config.get('use_dual_value_goals', False):
+            assert np.isclose(
+                self.config.get('value_cf_p_curgoal', self.config['value_p_curgoal'])
+                + self.config.get('value_cf_p_trajgoal', self.config['value_p_trajgoal'])
+                + self.config.get('value_cf_p_randomgoal', self.config['value_p_randomgoal']),
+                1.0,
+            )
 
         if self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl'):
             cur_idx = 0
@@ -232,13 +239,28 @@ class GCDataset:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
-        value_goal_idxs = self.sample_goals(
-            idxs,
-            self.config['value_p_curgoal'],
-            self.config['value_p_trajgoal'],
-            self.config['value_p_randomgoal'],
-            self.config['value_geom_sample'],
+        need_intraj_mask = (
+            self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl')
+            and self.config['value_p_randomgoal'] > 0
+            and self.config.get('z_proposal_coef', 0) > 0
         )
+        if need_intraj_mask:
+            value_goal_idxs, value_is_intraj = self.sample_goals(
+                idxs,
+                self.config['value_p_curgoal'],
+                self.config['value_p_trajgoal'],
+                self.config['value_p_randomgoal'],
+                self.config['value_geom_sample'],
+                return_intraj_mask=True,
+            )
+        else:
+            value_goal_idxs = self.sample_goals(
+                idxs,
+                self.config['value_p_curgoal'],
+                self.config['value_p_trajgoal'],
+                self.config['value_p_randomgoal'],
+                self.config['value_geom_sample'],
+            )
         actor_goal_idxs = self.sample_goals(
             idxs,
             self.config['actor_p_curgoal'],
@@ -249,6 +271,16 @@ class GCDataset:
 
         batch['value_goals'] = self.get_goal_observations(value_goal_idxs)
         batch['actor_goals'] = self.get_goal_observations(actor_goal_idxs)
+        if self.config.get('use_dual_value_goals', False):
+            value_goal_idxs_cf = self.sample_goals(
+                idxs,
+                self.config.get('value_cf_p_curgoal', self.config['value_p_curgoal']),
+                self.config.get('value_cf_p_trajgoal', self.config['value_p_trajgoal']),
+                self.config.get('value_cf_p_randomgoal', self.config['value_p_randomgoal']),
+                self.config.get('value_cf_geom_sample', self.config['value_geom_sample']),
+            )
+            batch['value_goals_intraj'] = self.get_goal_observations(value_goal_idxs)
+            batch['value_goals_cf'] = self.get_goal_observations(value_goal_idxs_cf)
         successes = (idxs == value_goal_idxs).astype(float)
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
@@ -256,13 +288,34 @@ class GCDataset:
         if self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl'):
             final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
             assert (idxs != final_state_idxs).all()
-            assert (idxs != value_goal_idxs).all()
 
-            value_midpoint_idxs = np.random.randint(idxs, value_goal_idxs)
+            if need_intraj_mask:
+                batch['value_goals_is_intraj'] = value_is_intraj.astype(np.float32)
+                # For in-trajectory samples: midpoint between s and g on trajectory.
+                # For counterfactual samples: midpoint is dummy (set to idxs; agent
+                # routes these to the latent backup which ignores the state midpoint).
+                # Use in-trajectory goal indices for randint (need idxs < goal_idxs).
+                intraj_goal_idxs = np.where(value_is_intraj, value_goal_idxs, final_state_idxs)
+                # Ensure intraj_goal_idxs > idxs (guaranteed for intraj; forced for cf dummy).
+                intraj_goal_idxs = np.maximum(intraj_goal_idxs, idxs + 1)
+                value_midpoint_idxs = np.random.randint(idxs, intraj_goal_idxs)
+                # Overwrite cf midpoints with idxs (dummy).
+                value_midpoint_idxs = np.where(value_is_intraj, value_midpoint_idxs, idxs)
+            else:
+                assert (idxs != value_goal_idxs).all()
+                value_midpoint_idxs = np.random.randint(idxs, value_goal_idxs)
 
             batch['value_goal_observations'] = self.get_observations(value_goal_idxs)
             batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
-            batch['value_offsets'] = value_goal_idxs - idxs
+            if self.config.get('use_dual_value_goals', False):
+                batch['value_goal_observations_intraj'] = self.get_observations(value_goal_idxs)
+                batch['value_goal_observations_cf'] = self.get_observations(value_goal_idxs_cf)
+            if need_intraj_mask:
+                # Only compute offsets for intraj; cf offsets are meaningless
+                # (cross-trajectory) and would produce inf via discount^negative.
+                batch['value_offsets'] = (value_goal_idxs - idxs) * value_is_intraj
+            else:
+                batch['value_offsets'] = value_goal_idxs - idxs
             batch['value_midpoint_offsets'] = value_midpoint_idxs - idxs
             batch['value_midpoint_observations'] = self.get_observations(value_midpoint_idxs)
             batch['value_midpoint_actions'] = self.dataset['actions'][value_midpoint_idxs]
@@ -317,14 +370,27 @@ class GCDataset:
                             'intraj_negative_observations',
                         ]
                     )
+                    if self.config.get('use_dual_value_goals', False):
+                        aug_keys.extend(
+                            [
+                                'value_goals_intraj',
+                                'value_goals_cf',
+                                'value_goal_observations_intraj',
+                                'value_goal_observations_cf',
+                            ]
+                        )
                     if 'hierarchical_target_observations' in batch:
                         aug_keys.append('hierarchical_target_observations')
                 self.augment(batch, aug_keys)
 
         return batch
 
-    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None):
-        """Sample goals for the given indices."""
+    def sample_goals(self, idxs, p_curgoal, p_trajgoal, p_randomgoal, geom_sample, discount=None, return_intraj_mask=False):
+        """Sample goals for the given indices.
+
+        If return_intraj_mask is True, also returns a boolean mask indicating which
+        samples used in-trajectory (trajgoal or curgoal) vs random (counterfactual) goals.
+        """
         batch_size = len(idxs)
         if discount is None:
             discount = self.config['discount']
@@ -346,14 +412,18 @@ class GCDataset:
             ).astype(int)
         if p_curgoal == 1.0:
             goal_idxs = idxs
+            is_intraj = np.ones(batch_size, dtype=bool)
         else:
-            goal_idxs = np.where(
-                np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal), traj_goal_idxs, random_goal_idxs
-            )
+            is_traj = np.random.rand(batch_size) < p_trajgoal / (1.0 - p_curgoal)
+            goal_idxs = np.where(is_traj, traj_goal_idxs, random_goal_idxs)
 
             # Goals at the current state.
-            goal_idxs = np.where(np.random.rand(batch_size) < p_curgoal, idxs, goal_idxs)
+            is_cur = np.random.rand(batch_size) < p_curgoal
+            goal_idxs = np.where(is_cur, idxs, goal_idxs)
+            is_intraj = is_traj | is_cur
 
+        if return_intraj_mask:
+            return goal_idxs, is_intraj
         return goal_idxs
 
     def augment(self, batch, keys):
