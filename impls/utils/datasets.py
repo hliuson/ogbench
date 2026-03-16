@@ -204,7 +204,12 @@ class GCDataset:
                 1.0,
             )
 
-        if self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl'):
+        if self.config.get('agent_name') in (
+            'trl',
+            'latent_trl',
+            'discrete_latent_trl',
+            'vae_trl',
+        ):
             cur_idx = 0
             valid_idxs = []
             for terminal_idx in self.terminal_locs:
@@ -239,8 +244,14 @@ class GCDataset:
             batch['observations'] = self.get_observations(idxs)
             batch['next_observations'] = self.get_observations(idxs + 1)
 
+        midpoint_agent_names = (
+            'trl',
+            'latent_trl',
+            'discrete_latent_trl',
+            'vae_trl',
+        )
         need_intraj_mask = (
-            self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl')
+            self.config.get('agent_name') in midpoint_agent_names
             and self.config['value_p_randomgoal'] > 0
             and self.config.get('z_proposal_coef', 0) > 0
         )
@@ -285,7 +296,7 @@ class GCDataset:
         batch['masks'] = 1.0 - successes
         batch['rewards'] = successes - (1.0 if self.config['gc_negative'] else 0.0)
 
-        if self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl'):
+        if self.config.get('agent_name') in midpoint_agent_names:
             final_state_idxs = self.terminal_locs[np.searchsorted(self.terminal_locs, idxs)]
             assert (idxs != final_state_idxs).all()
 
@@ -358,7 +369,7 @@ class GCDataset:
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 aug_keys = ['observations', 'next_observations', 'value_goals', 'actor_goals']
-                if self.config.get('agent_name') in ('trl', 'latent_trl', 'discrete_latent_trl'):
+                if self.config.get('agent_name') in midpoint_agent_names:
                     aug_keys.extend(
                         [
                             'value_goal_observations',

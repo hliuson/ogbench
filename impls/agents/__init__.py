@@ -11,6 +11,7 @@ from agents.latent_trl import LatentTRLAgent
 from agents.discrete_latent_trl import DiscreteLatentTRLAgent
 from agents.discrete_latent_sharsa import DiscreteLatentSHARSAAgent
 from agents.latent_sharsa import LatentSHARSAAgent
+from agents.vae_trl import VaeTRLAgent
 
 agents = dict(
     crl=CRLAgent,
@@ -26,4 +27,5 @@ agents = dict(
     discrete_latent_trl=DiscreteLatentTRLAgent,
     discrete_latent_sharsa=DiscreteLatentSHARSAAgent,
     latent_sharsa=LatentSHARSAAgent,
+    vae_trl=VaeTRLAgent,
 )
