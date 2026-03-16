@@ -47,6 +47,5 @@ def visualize_trajs(env_name, trajs):
 
     fig.tight_layout()
     canvas.draw()
-    out_image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-    out_image = out_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    out_image = np.asarray(canvas.buffer_rgba())[..., :3].copy()
     return out_image
