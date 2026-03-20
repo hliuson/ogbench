@@ -59,33 +59,34 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def _get_pe_info(self):
         return self._get_pe_info_from_config(self.config)
 
-    def _enc_params_for_role(self, grad_params, role):
-        """Return encoder params for a given RL role, respecting stop-grad config."""
-        if self.config.get('vae_stopgrad_for_rl', True):
-            return None
-        if role == 'observation' and self.config.get('vae_stopgrad_observations_for_rl', False):
-            return None
-        if role == 'goal' and self.config.get('vae_stopgrad_goals_for_rl', False):
-            return None
-        if role == 'midpoint' and self.config.get('vae_stopgrad_midpoints_for_rl', False):
-            return None
-        return grad_params
-
-    def _encode(self, observations, grad_params=None):
-        """Encode observations through VAE encoder, returns mu.
+    def _encode(self, observations, grad_params=None, rng=None, sample=False):
+        """Encode observations through VAE encoder.
 
         When grad_params is None: stop-gradient (standard TrainState stored params).
         When grad_params is provided: gradients flow through encoder.
         """
         if grad_params is not None:
-            mu, _ = self.network.select('vae_encoder')(observations, params=grad_params)
+            mu, log_var = self.network.select('vae_encoder')(observations, params=grad_params)
         else:
-            mu, _ = self.network.select('vae_encoder')(observations)
+            mu, log_var = self.network.select('vae_encoder')(observations)
+
+        if sample:
+            if rng is None:
+                raise ValueError('Sampling latents requires rng.')
+            std = jnp.exp(0.5 * log_var)
+            eps = jax.random.normal(rng, mu.shape)
+            return mu + std * eps
         return mu
 
-    def _encode_rl(self, observations, grad_params, role):
-        """Encode observations for an RL role with optional per-role stop-grad."""
-        return self._encode(observations, self._enc_params_for_role(grad_params, role))
+    def _encode_rl(self, observations, grad_params, role, rng=None):
+        """Encode observations for an RL role with gradients through the encoder."""
+        del role
+        return self._encode(
+            observations,
+            grad_params,
+            rng=rng,
+            sample=self.config.get('sample_latent_for_rl', False),
+        )
 
     @staticmethod
     def bce_loss(pred_logit, target):
@@ -104,7 +105,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         return 'value_goals_is_intraj' in batch and self.config['z_proposal_coef'] > 0
 
     def vae_loss(self, batch, grad_params, rng):
-        """VAE reconstruction + KL loss over observations and midpoints."""
+        """Variational bottleneck loss over observations and midpoints."""
         obs = batch['observations']
         midpoints = batch['value_midpoint_observations']
         # Combine observations and midpoints for VAE training.
@@ -117,12 +118,15 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         eps = jax.random.normal(rng, mu.shape)
         z = mu + std * eps
 
-        recon = self.network.select('vae_decoder')(z, params=grad_params)
-
-        recon_loss = jnp.mean((recon - all_obs) ** 2)
+        recon_coef = self.config.get('vae_recon_coef', 1.0)
+        if recon_coef > 0:
+            recon = self.network.select('vae_decoder')(z, params=grad_params)
+            recon_loss = jnp.mean((recon - all_obs) ** 2)
+        else:
+            recon_loss = jnp.asarray(0.0, dtype=mu.dtype)
         kl_loss = -0.5 * jnp.mean(1 + log_var - mu ** 2 - jnp.exp(log_var))
 
-        total_loss = recon_loss + self.config['vae_beta'] * kl_loss
+        total_loss = recon_coef * recon_loss + self.config['vae_beta'] * kl_loss
 
         return total_loss, {
             'total_loss': total_loss,
@@ -135,11 +139,12 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def q_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
         """Train Q(z_s, z_g, z_mid) with factored backup using single value network."""
         has_cf = self._has_cf_z_stitching(batch)
+        z_s_rng, z_g_rng, z_mid_rng, cf_rng = jax.random.split(rng, 4)
 
         goal_key = 'value_goal_observations'
-        z_s = self._encode_rl(batch['observations'], grad_params, 'observation')
-        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal')
-        z_mid = self._encode_rl(batch['value_midpoint_observations'], grad_params, 'midpoint')
+        z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
+        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal', rng=z_g_rng)
+        z_mid = self._encode_rl(batch['value_midpoint_observations'], grad_params, 'midpoint', rng=z_mid_rng)
 
         q_logits = self.network.select('q')(
             z_s, goals=z_g, actions=z_mid, params=grad_params,
@@ -168,7 +173,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             is_intraj = batch['value_goals_is_intraj']
             is_intraj_2d = is_intraj[None, ...]
 
-            z_cf = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_cf = self._sample_z_proposal(batch, cf_rng, num_samples=1)
             z_cf = jax.lax.stop_gradient(z_cf)
 
             q_cf_logits = self.network.select('q')(
@@ -212,10 +217,11 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def value_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
         """Value loss with expectile regression, all in latent space."""
         has_cf = self._has_cf_z_stitching(batch)
+        z_s_rng, z_g_rng, proposal_rng = jax.random.split(rng, 3)
 
         goal_key = 'value_goal_observations'
-        z_s = self._encode_rl(batch['observations'], grad_params, 'observation')
-        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal')
+        z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
+        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal', rng=z_g_rng)
 
         v_logits = self.network.select('value')(z_s, goals=z_g, params=grad_params)
         vs = jax.nn.sigmoid(v_logits)
@@ -232,18 +238,21 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         if use_proposal and has_cf:
             is_intraj = batch['value_goals_is_intraj']
 
-            z_proposed = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_proposed = self._sample_z_proposal(batch, proposal_rng, num_samples=1)
             z_proposed = jax.lax.stop_gradient(z_proposed)
 
             q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
             q_proposed = jax.nn.sigmoid(q_proposed_logits)
             target_proposed = self._aggregate_q_ensembles(q_proposed)
 
-            intraj_target = jnp.maximum(target_traj, cf_weight * target_proposed)
+            if self.config.get('intraj_cf_max_target', True):
+                intraj_target = jnp.maximum(target_traj, cf_weight * target_proposed)
+            else:
+                intraj_target = target_traj
             cf_target_val = cf_weight * target_proposed
             target = jnp.where(is_intraj, intraj_target, cf_target_val)
         elif use_proposal:
-            z_proposed = self._sample_z_proposal(batch, rng, num_samples=1)
+            z_proposed = self._sample_z_proposal(batch, proposal_rng, num_samples=1)
             z_proposed = jax.lax.stop_gradient(z_proposed)
 
             q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
@@ -253,11 +262,15 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         else:
             target = target_traj
 
-        expectile_weight = jnp.where(
-            target >= vs,
-            self.config['expectile'],
-            (1 - self.config['expectile']),
-        )
+        if use_proposal and has_cf:
+            tau = jnp.where(
+                is_intraj,
+                self.config['expectile'],
+                self.config.get('cf_expectile', self.config['expectile']),
+            )
+        else:
+            tau = jnp.full_like(target, self.config['expectile'])
+        expectile_weight = jnp.where(target >= vs, tau, (1 - tau))
         dist = jax.lax.stop_gradient(jnp.log(target) / jnp.log(self.config['discount']))
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
         v_loss = expectile_weight * dist_weight * self.bce_loss(v_logits, jax.lax.stop_gradient(target))
@@ -290,11 +303,12 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def z_proposal_loss(self, batch, grad_params, rng):
         """Train iMF z-proposal: f(noise; z_s, z_g) -> z_mid, all in latent space."""
         goal_key = 'value_goal_observations'
+        z_s_rng, z_g_rng, imf_rng = jax.random.split(rng, 3)
         z_target = self._encode(batch['value_midpoint_observations'])
         z_target = jax.lax.stop_gradient(z_target)
 
-        z_s = self._encode_rl(batch['observations'], grad_params, 'observation')
-        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal')
+        z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
+        z_g = self._encode_rl(batch[goal_key], grad_params, 'goal', rng=z_g_rng)
 
         def vector_field_fn(noise, times):
             return self.network.select('z_proposal')(
@@ -305,7 +319,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         intraj_mask = batch.get('value_goals_is_intraj', None)
 
         loss, flow_info = imf_loss(
-            rng, z_target, vector_field_fn,
+            imf_rng, z_target, vector_field_fn,
             r_equals_t_prob=0.5,
             mask=intraj_mask,
         )
@@ -352,11 +366,12 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         z_samples = imf_one_shot_sample(rng, sample_shape, vector_field_fn)
         return z_samples
 
-    def q_short_loss(self, batch, grad_params):
+    def q_short_loss(self, batch, grad_params, rng):
         """Q_short(z_s, raw_goal, a) <- gamma * V(z_s', z_g). Raw goals for eval compatibility."""
-        z_s = self._encode_rl(batch['observations'], grad_params, 'observation')
-        z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation')
-        z_g_encoded = self._encode_rl(batch['value_goal_observations'], grad_params, 'goal')
+        z_s_rng, z_next_rng, z_g_rng = jax.random.split(rng, 3)
+        z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
+        z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation', rng=z_next_rng)
+        z_g_encoded = self._encode_rl(batch['value_goal_observations'], grad_params, 'goal', rng=z_g_rng)
 
         v_next_logits = self.network.select('target_value')(z_next, goals=z_g_encoded)
         v_next = jax.nn.sigmoid(v_next_logits)
@@ -381,15 +396,16 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def actor_loss(self, batch, grad_params, rng=None):
         """Actor loss. Actor takes (z_s, raw_goal) for eval compatibility."""
         pe_info = self._get_pe_info()
+        rngs = jax.random.split(rng, 5)
 
-        z_s = self._encode_rl(batch['observations'], grad_params, 'observation')
+        z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=rngs[0])
         raw_goals = batch['actor_goals']
 
         if self.config['pe_type'] == 'rpg':
             dist = self.network.select('actor')(z_s, raw_goals, params=grad_params)
 
-            z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation')
-            z_actor_g = self._encode_rl(batch['actor_goal_observations'], grad_params, 'goal')
+            z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation', rng=rngs[1])
+            z_actor_g = self._encode_rl(batch['actor_goal_observations'], grad_params, 'goal', rng=rngs[2])
             v_next = self.network.select('value')(z_next, goals=z_actor_g)
             v = jnp.minimum(v_next[0], v_next[1])
 
@@ -412,8 +428,8 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         if self.config['pe_type'] == 'discrete':
             dist = self.network.select('actor')(z_s, raw_goals, params=grad_params)
 
-            z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation')
-            z_actor_g = self._encode_rl(batch['actor_goal_observations'], grad_params, 'goal')
+            z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation', rng=rngs[1])
+            z_actor_g = self._encode_rl(batch['actor_goal_observations'], grad_params, 'goal', rng=rngs[2])
             v = self.network.select('value')(z_next, goals=z_actor_g).mean(axis=0)
             v_loss = -v.mean()
 
@@ -432,7 +448,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
 
         if self.config['pe_type'] == 'frs':
             batch_size, action_dim = batch['actions'].shape
-            x_rng, t_rng = jax.random.split(rng, 2)
+            x_rng, t_rng = rngs[3], rngs[4]
 
             x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
             x_1 = batch['actions']
@@ -458,8 +474,6 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         rng, vae_rng, value_rng, q_rng, q_short_rng, actor_rng, z_proposal_rng = (
             jax.random.split(rng, 7)
         )
-
-        del q_short_rng  # deterministic loss
 
         # CF warmup weight.
         cf_burnin_steps = self.config.get('cf_burnin_steps', 0)
@@ -497,7 +511,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             for k, v in z_proposal_info.items():
                 info[f'z_proposal/{k}'] = v
 
-        q_short_loss, q_short_info = self.q_short_loss(batch, grad_params)
+        q_short_loss, q_short_info = self.q_short_loss(batch, grad_params, rng=q_short_rng)
         for k, v in q_short_info.items():
             info[f'q_short/{k}'] = v
 
@@ -720,25 +734,25 @@ def get_config():
             actor_hidden_dims=(1024,) * 4,
             value_hidden_dims=(1024,) * 4,
             vae_hidden_dims=(512, 512),
-            vae_encoder_hidden_dims=(512, 512),
+            vae_encoder_hidden_dims=(1024,) * 4,
             vae_decoder_hidden_dims=(512, 512),
             layer_norm=True,
             discount=0.999,
             tau=0.005,
             lam=0.0,
             expectile=0.7,
+            cf_expectile=0.7,
             q_agg='min',
-            z_dim=64,
+            z_dim=32,
             vae_beta=0.01,
             vae_coef=1.0,
-            vae_stopgrad_for_rl=True,
-            vae_stopgrad_observations_for_rl=False,
-            vae_stopgrad_goals_for_rl=False,
-            vae_stopgrad_midpoints_for_rl=False,
-            z_proposal_coef=0.0,
+            vae_recon_coef=0.25,
+            sample_latent_for_rl=False,
+            z_proposal_coef=1.0,
             cf_num_z_proposals=1,
-            cf_burnin_steps=0,
-            cf_warmup_steps=0,
+            cf_burnin_steps=50000,
+            cf_warmup_steps=50000,
+            intraj_cf_max_target=True,
             pe_type='frs',
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),
@@ -746,8 +760,8 @@ def get_config():
             discrete=False,
             dataset_class='GCDataset',
             value_p_curgoal=0.0,
-            value_p_trajgoal=1.0,
-            value_p_randomgoal=0.0,
+            value_p_trajgoal=0.8,
+            value_p_randomgoal=0.2,
             value_geom_sample=True,
             actor_p_curgoal=0.0,
             actor_p_trajgoal=0.5,
