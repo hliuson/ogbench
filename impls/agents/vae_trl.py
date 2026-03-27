@@ -59,6 +59,9 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def _get_pe_info(self):
         return self._get_pe_info_from_config(self.config)
 
+    def _get_reg_coef(self):
+        return self.config.get('reg_coef', self.config.get('vae_coef', 1.0))
+
     def _encode(self, observations, grad_params=None, rng=None, sample=False):
         """Encode observations through VAE encoder.
 
@@ -101,7 +104,51 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             return values.mean(axis=0)
         raise ValueError(f"Unsupported q_agg: {self.config['q_agg']}")
 
-    def _has_cf_z_stitching(self, batch):
+    def _aggregate_value_ensembles(self, values):
+        return self._aggregate_q_ensembles(values)
+
+    def _local_step_consistency_metrics(self, v_cur, v_next, mask=None):
+        discount = self.config['discount']
+        d_cur = -jnp.log(jnp.clip(v_cur, 1e-8, 1.0)) / (-jnp.log(discount))
+        d_next = -jnp.log(jnp.clip(v_next, 1e-8, 1.0)) / (-jnp.log(discount))
+        delta = jnp.abs(d_cur - d_next)
+        violation = jnp.maximum(delta - 1.0, 0.0)
+        if mask is None:
+            mask = jnp.ones_like(delta)
+        return {
+            'local_step_delta_mean': self._masked_mean(delta, mask),
+            'local_step_violation_mean': self._masked_mean(violation, mask),
+            'local_step_violation_frac': self._masked_mean(
+                (violation > 0).astype(violation.dtype),
+                mask,
+            ),
+        }
+
+    @staticmethod
+    def _masked_mean(values, mask):
+        mask = mask.astype(values.dtype)
+        denom = jnp.maximum(mask.sum(), 1.0)
+        return (values * mask).sum() / denom
+
+    @staticmethod
+    def _local_value_diff_metrics(v_cur, v_next, threshold, mask=None):
+        delta = jnp.abs(v_cur - v_next)
+        violation = jnp.maximum(delta - threshold, 0.0)
+        if mask is None:
+            mask = jnp.ones_like(delta)
+        return {
+            'local_value_delta_mean': VaeTRLAgent._masked_mean(delta, mask),
+            'local_value_violation_mean': VaeTRLAgent._masked_mean(violation, mask),
+            'local_value_violation_frac': VaeTRLAgent._masked_mean(
+                (violation > 0).astype(violation.dtype),
+                mask,
+            ),
+        }
+
+    def _has_learned_z_proposal(self):
+        return self.config['z_proposal_coef'] > 0
+
+    def _has_cf_midpoint_stitching(self, batch):
         return 'value_goals_is_intraj' in batch and self.config['z_proposal_coef'] > 0
 
     def vae_loss(self, batch, grad_params, rng):
@@ -136,9 +183,12 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             'z_std': std.mean(),
         }
 
+    def representation_loss(self, batch, grad_params, rng):
+        return self.vae_loss(batch, grad_params, rng)
+
     def q_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
         """Train Q(z_s, z_g, z_mid) with factored backup using single value network."""
-        has_cf = self._has_cf_z_stitching(batch)
+        has_cf = self._has_cf_midpoint_stitching(batch)
         z_s_rng, z_g_rng, z_mid_rng, cf_rng = jax.random.split(rng, 4)
 
         goal_key = 'value_goal_observations'
@@ -173,7 +223,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             is_intraj = batch['value_goals_is_intraj']
             is_intraj_2d = is_intraj[None, ...]
 
-            z_cf = self._sample_z_proposal(batch, cf_rng, num_samples=1)
+            z_cf = self._sample_cf_midpoints(batch, cf_rng, num_samples=1)
             z_cf = jax.lax.stop_gradient(z_cf)
 
             q_cf_logits = self.network.select('q')(
@@ -216,34 +266,93 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
 
     def value_loss(self, batch, grad_params, rng=None, cf_weight=1.0):
         """Value loss with expectile regression, all in latent space."""
-        has_cf = self._has_cf_z_stitching(batch)
-        z_s_rng, z_g_rng, proposal_rng = jax.random.split(rng, 3)
+        has_cf = self._has_cf_midpoint_stitching(batch)
+        z_s_rng, z_g_rng, proposal_rng, z_next_rng = jax.random.split(rng, 4)
 
         goal_key = 'value_goal_observations'
         z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
         z_g = self._encode_rl(batch[goal_key], grad_params, 'goal', rng=z_g_rng)
+        z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation', rng=z_next_rng)
 
         v_logits = self.network.select('value')(z_s, goals=z_g, params=grad_params)
         vs = jax.nn.sigmoid(v_logits)
+        next_v_logits = self.network.select('value')(z_next, goals=z_g, params=grad_params)
+        next_vs = jax.nn.sigmoid(next_v_logits)
 
-        # --- Trajectory midpoint Q target ---
+        backup_mode = self.config.get('value_backup_mode', 'q')
         z_mid = self._encode(batch['value_midpoint_observations'])
         z_mid = jax.lax.stop_gradient(z_mid)
-        q_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_mid)
-        q_traj = jax.nn.sigmoid(q_logits)
-        target_traj = self._aggregate_q_ensembles(q_traj)
+        second_offset = batch['value_offsets'] - batch['value_midpoint_offsets']
+
+        if backup_mode == 'q':
+            q_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_mid)
+            q_traj = jax.nn.sigmoid(q_logits)
+            target_traj = self._aggregate_q_ensembles(q_traj)
+        elif backup_mode == 'factorized_v':
+            first_v_logits = self.network.select('target_value')(z_s, goals=z_mid)
+            second_v_logits = self.network.select('target_value')(z_mid, goals=z_g)
+            first_v = jnp.where(
+                (batch['value_midpoint_offsets'] <= 1)[None, ...],
+                self.config['discount'] ** batch['value_midpoint_offsets'][None, ...],
+                jax.nn.sigmoid(first_v_logits),
+            )
+            second_v = jnp.where(
+                (second_offset <= 1)[None, ...],
+                self.config['discount'] ** second_offset[None, ...],
+                jax.nn.sigmoid(second_v_logits),
+            )
+            target_traj = self._aggregate_value_ensembles(first_v) * self._aggregate_value_ensembles(second_v)
+        else:
+            raise ValueError(f'Unsupported value_backup_mode: {backup_mode}')
 
         # --- Proposed z target ---
-        use_proposal = self.config['z_proposal_coef'] > 0
-        if use_proposal and has_cf:
+        use_cf_midpoints = has_cf
+        if use_cf_midpoints and has_cf:
             is_intraj = batch['value_goals_is_intraj']
+            num_cf_samples = max(1, int(self.config.get('cf_num_z_proposals', 1)))
 
-            z_proposed = self._sample_z_proposal(batch, proposal_rng, num_samples=1)
+            z_proposed = self._sample_cf_midpoints(batch, proposal_rng, num_samples=num_cf_samples)
             z_proposed = jax.lax.stop_gradient(z_proposed)
 
-            q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
-            q_proposed = jax.nn.sigmoid(q_proposed_logits)
-            target_proposed = self._aggregate_q_ensembles(q_proposed)
+            if backup_mode == 'q':
+                if num_cf_samples == 1:
+                    q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
+                    q_proposed = jax.nn.sigmoid(q_proposed_logits)
+                    target_proposed = self._aggregate_q_ensembles(q_proposed)
+                else:
+                    z_s_bc = jnp.broadcast_to(z_s[None], (num_cf_samples, *z_s.shape))
+                    z_g_bc = jnp.broadcast_to(z_g[None], (num_cf_samples, *z_g.shape))
+                    q_proposed_logits = self.network.select('target_q')(
+                        z_s_bc.reshape(-1, z_s.shape[-1]),
+                        goals=z_g_bc.reshape(-1, z_g.shape[-1]),
+                        actions=z_proposed.reshape(-1, z_proposed.shape[-1]),
+                    )
+                    q_proposed = jax.nn.sigmoid(q_proposed_logits)
+                    target_proposed = self._aggregate_q_ensembles(q_proposed).reshape(num_cf_samples, -1).max(axis=0)
+            elif backup_mode == 'factorized_v':
+                if num_cf_samples == 1:
+                    first_v_logits = self.network.select('target_value')(z_s, goals=z_proposed)
+                    second_v_logits = self.network.select('target_value')(z_proposed, goals=z_g)
+                    target_proposed = (
+                        self._aggregate_value_ensembles(jax.nn.sigmoid(first_v_logits))
+                        * self._aggregate_value_ensembles(jax.nn.sigmoid(second_v_logits))
+                    )
+                else:
+                    z_s_bc = jnp.broadcast_to(z_s[None], (num_cf_samples, *z_s.shape))
+                    z_g_bc = jnp.broadcast_to(z_g[None], (num_cf_samples, *z_g.shape))
+                    first_v_logits = self.network.select('target_value')(
+                        z_s_bc.reshape(-1, z_s.shape[-1]),
+                        goals=z_proposed.reshape(-1, z_proposed.shape[-1]),
+                    )
+                    second_v_logits = self.network.select('target_value')(
+                        z_proposed.reshape(-1, z_proposed.shape[-1]),
+                        goals=z_g_bc.reshape(-1, z_g.shape[-1]),
+                    )
+                    first_v = self._aggregate_value_ensembles(jax.nn.sigmoid(first_v_logits)).reshape(num_cf_samples, -1)
+                    second_v = self._aggregate_value_ensembles(jax.nn.sigmoid(second_v_logits)).reshape(num_cf_samples, -1)
+                    target_proposed = (first_v * second_v).max(axis=0)
+            else:
+                raise ValueError(f'Unsupported value_backup_mode: {backup_mode}')
 
             if self.config.get('intraj_cf_max_target', True):
                 intraj_target = jnp.maximum(target_traj, cf_weight * target_proposed)
@@ -251,18 +360,54 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
                 intraj_target = target_traj
             cf_target_val = cf_weight * target_proposed
             target = jnp.where(is_intraj, intraj_target, cf_target_val)
-        elif use_proposal:
-            z_proposed = self._sample_z_proposal(batch, proposal_rng, num_samples=1)
+        elif use_cf_midpoints:
+            num_cf_samples = max(1, int(self.config.get('cf_num_z_proposals', 1)))
+            z_proposed = self._sample_cf_midpoints(batch, proposal_rng, num_samples=num_cf_samples)
             z_proposed = jax.lax.stop_gradient(z_proposed)
-
-            q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
-            q_proposed = jax.nn.sigmoid(q_proposed_logits)
-            target_proposed = self._aggregate_q_ensembles(q_proposed)
+            if backup_mode == 'q':
+                if num_cf_samples == 1:
+                    q_proposed_logits = self.network.select('target_q')(z_s, goals=z_g, actions=z_proposed)
+                    q_proposed = jax.nn.sigmoid(q_proposed_logits)
+                    target_proposed = self._aggregate_q_ensembles(q_proposed)
+                else:
+                    z_s_bc = jnp.broadcast_to(z_s[None], (num_cf_samples, *z_s.shape))
+                    z_g_bc = jnp.broadcast_to(z_g[None], (num_cf_samples, *z_g.shape))
+                    q_proposed_logits = self.network.select('target_q')(
+                        z_s_bc.reshape(-1, z_s.shape[-1]),
+                        goals=z_g_bc.reshape(-1, z_g.shape[-1]),
+                        actions=z_proposed.reshape(-1, z_proposed.shape[-1]),
+                    )
+                    q_proposed = jax.nn.sigmoid(q_proposed_logits)
+                    target_proposed = self._aggregate_q_ensembles(q_proposed).reshape(num_cf_samples, -1).max(axis=0)
+            elif backup_mode == 'factorized_v':
+                if num_cf_samples == 1:
+                    first_v_logits = self.network.select('target_value')(z_s, goals=z_proposed)
+                    second_v_logits = self.network.select('target_value')(z_proposed, goals=z_g)
+                    target_proposed = (
+                        self._aggregate_value_ensembles(jax.nn.sigmoid(first_v_logits))
+                        * self._aggregate_value_ensembles(jax.nn.sigmoid(second_v_logits))
+                    )
+                else:
+                    z_s_bc = jnp.broadcast_to(z_s[None], (num_cf_samples, *z_s.shape))
+                    z_g_bc = jnp.broadcast_to(z_g[None], (num_cf_samples, *z_g.shape))
+                    first_v_logits = self.network.select('target_value')(
+                        z_s_bc.reshape(-1, z_s.shape[-1]),
+                        goals=z_proposed.reshape(-1, z_proposed.shape[-1]),
+                    )
+                    second_v_logits = self.network.select('target_value')(
+                        z_proposed.reshape(-1, z_proposed.shape[-1]),
+                        goals=z_g_bc.reshape(-1, z_g.shape[-1]),
+                    )
+                    first_v = self._aggregate_value_ensembles(jax.nn.sigmoid(first_v_logits)).reshape(num_cf_samples, -1)
+                    second_v = self._aggregate_value_ensembles(jax.nn.sigmoid(second_v_logits)).reshape(num_cf_samples, -1)
+                    target_proposed = (first_v * second_v).max(axis=0)
+            else:
+                raise ValueError(f'Unsupported value_backup_mode: {backup_mode}')
             target = jnp.maximum(target_traj, target_proposed)
         else:
             target = target_traj
 
-        if use_proposal and has_cf:
+        if use_cf_midpoints and has_cf:
             tau = jnp.where(
                 is_intraj,
                 self.config['expectile'],
@@ -275,6 +420,27 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         dist_weight = (1 / (1 + dist)) ** self.config['lam']
         v_loss = expectile_weight * dist_weight * self.bce_loss(v_logits, jax.lax.stop_gradient(target))
         total_loss = v_loss.mean()
+
+        cur_v_pred = self._aggregate_value_ensembles(vs)
+        next_v_pred = self._aggregate_value_ensembles(next_vs)
+        discount = self.config['discount']
+        d_cur = -jnp.log(jnp.clip(cur_v_pred, 1e-8, 1.0)) / (-jnp.log(discount))
+        d_next = -jnp.log(jnp.clip(next_v_pred, 1e-8, 1.0)) / (-jnp.log(discount))
+        local_step_violation = jax.nn.relu(jnp.abs(d_cur - d_next) - 1.0)
+        local_step_mask = jnp.ones_like(local_step_violation)
+        if has_cf and self.config.get('local_step_hinge_only_cf', True):
+            local_step_mask = 1.0 - batch['value_goals_is_intraj']
+        local_step_hinge_loss = self._masked_mean(local_step_violation, local_step_mask)
+        total_loss = total_loss + self.config.get('local_step_hinge_coef', 0.0) * local_step_hinge_loss
+
+        local_value_diff = jnp.abs(cur_v_pred - next_v_pred)
+        local_value_mask = jnp.ones_like(local_value_diff)
+        if has_cf and self.config.get('local_value_smoothness_only_cf', True):
+            local_value_mask = 1.0 - batch['value_goals_is_intraj']
+        local_value_threshold = self.config.get('local_value_smoothness_threshold', 0.01)
+        local_value_hinge = jax.nn.relu(local_value_diff - local_value_threshold)
+        local_value_smoothness_loss = self._masked_mean(local_value_hinge, local_value_mask)
+        total_loss = total_loss + self.config.get('local_value_smoothness_coef', 0.0) * local_value_smoothness_loss
 
         predicted_steps = jnp.log(vs + 1e-8) / jnp.log(self.config['discount'])
         actual_steps = batch['value_offsets']
@@ -289,15 +455,21 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         info = {
             'total_loss': total_loss,
             'v_loss': total_loss,
+            'bootstrapped_v_loss': v_loss.mean(),
             'v_mean': vs.mean(),
             'v_max': vs.max(),
             'v_min': vs.min(),
             'calibration_rel_gap_mean': relative_gap.mean(),
             'calibration_rel_gap_max': relative_gap.max(),
         }
-        if use_proposal:
-            info['q_proposed_mean'] = target_proposed.mean()
-            info['q_traj_mean'] = target_traj.mean()
+        info.update(self._local_step_consistency_metrics(cur_v_pred, next_v_pred, local_step_mask))
+        info.update(self._local_value_diff_metrics(cur_v_pred, next_v_pred, local_value_threshold, local_value_mask))
+        if use_cf_midpoints:
+            info['backup_proposed_mean'] = target_proposed.mean()
+            info['backup_traj_mean'] = target_traj.mean()
+            if backup_mode == 'q':
+                info['q_proposed_mean'] = target_proposed.mean()
+                info['q_traj_mean'] = target_traj.mean()
         return total_loss, info
 
     def z_proposal_loss(self, batch, grad_params, rng):
@@ -366,12 +538,19 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         z_samples = imf_one_shot_sample(rng, sample_shape, vector_field_fn)
         return z_samples
 
+    def _sample_cf_midpoints(self, batch, rng, num_samples=1):
+        return self._sample_z_proposal(batch, rng, num_samples=num_samples)
+
     def q_short_loss(self, batch, grad_params, rng):
         """Q_short(z_s, raw_goal, a) <- gamma * V(z_s', z_g). Raw goals for eval compatibility."""
         z_s_rng, z_next_rng, z_g_rng = jax.random.split(rng, 3)
         z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
         z_next = self._encode_rl(batch['next_observations'], grad_params, 'observation', rng=z_next_rng)
         z_g_encoded = self._encode_rl(batch['value_goal_observations'], grad_params, 'goal', rng=z_g_rng)
+        if self.config.get('q_short_stopgrad_encoder', False):
+            z_s = jax.lax.stop_gradient(z_s)
+            z_next = jax.lax.stop_gradient(z_next)
+            z_g_encoded = jax.lax.stop_gradient(z_g_encoded)
 
         v_next_logits = self.network.select('target_value')(z_next, goals=z_g_encoded)
         v_next = jax.nn.sigmoid(v_next_logits)
@@ -489,12 +668,13 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             cf_weight = 1.0
         info['cf_weight'] = jnp.asarray(cf_weight, dtype=jnp.float32)
 
-        if self.config['vae_coef'] > 0:
-            vae_loss, vae_info = self.vae_loss(batch, grad_params, rng=vae_rng)
-            for k, v in vae_info.items():
+        reg_coef = self._get_reg_coef()
+        if reg_coef > 0:
+            reg_loss, reg_info = self.representation_loss(batch, grad_params, rng=vae_rng)
+            for k, v in reg_info.items():
                 info[f'vae/{k}'] = v
         else:
-            vae_loss = jnp.asarray(0.0, dtype=jnp.float32)
+            reg_loss = jnp.asarray(0.0, dtype=jnp.float32)
             info['vae/disabled'] = jnp.asarray(1.0, dtype=jnp.float32)
 
         value_loss, value_info = self.value_loss(batch, grad_params, rng=value_rng, cf_weight=cf_weight)
@@ -506,7 +686,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             info[f'q/{k}'] = v
 
         z_proposal_loss = 0.0
-        if self.config['z_proposal_coef'] > 0:
+        if self._has_learned_z_proposal():
             z_proposal_loss, z_proposal_info = self.z_proposal_loss(batch, grad_params, rng=z_proposal_rng)
             for k, v in z_proposal_info.items():
                 info[f'z_proposal/{k}'] = v
@@ -520,7 +700,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             info[f'actor/{k}'] = v
 
         loss = (
-            self.config['vae_coef'] * vae_loss
+            reg_coef * reg_loss
             + value_loss
             + q_loss
             + self.config['z_proposal_coef'] * z_proposal_loss
@@ -743,9 +923,10 @@ def get_config():
             expectile=0.7,
             cf_expectile=0.7,
             q_agg='min',
+            value_backup_mode='q',
             z_dim=32,
             vae_beta=0.01,
-            vae_coef=1.0,
+            reg_coef=1.0,
             vae_recon_coef=0.25,
             sample_latent_for_rl=False,
             z_proposal_coef=1.0,
@@ -753,6 +934,12 @@ def get_config():
             cf_burnin_steps=50000,
             cf_warmup_steps=50000,
             intraj_cf_max_target=True,
+            local_step_hinge_coef=0.0,
+            local_step_hinge_only_cf=True,
+            local_value_smoothness_coef=0.0,
+            local_value_smoothness_threshold=0.01,
+            local_value_smoothness_only_cf=True,
+            q_short_stopgrad_encoder=False,
             pe_type='frs',
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

@@ -208,6 +208,9 @@ class GCDataset:
             'trl',
             'latent_trl',
             'discrete_latent_trl',
+            'ltrl_sharsa',
+            'ltrl_hiql',
+            'state_trl',
             'vae_trl',
         ):
             cur_idx = 0
@@ -248,6 +251,9 @@ class GCDataset:
             'trl',
             'latent_trl',
             'discrete_latent_trl',
+            'ltrl_sharsa',
+            'ltrl_hiql',
+            'state_trl',
             'vae_trl',
         )
         need_intraj_mask = (
@@ -317,7 +323,10 @@ class GCDataset:
                 value_midpoint_idxs = np.random.randint(idxs, value_goal_idxs)
 
             batch['value_goal_observations'] = self.get_observations(value_goal_idxs)
-            batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
+            if self.config.get('agent_name') == 'ltrl_hiql':
+                batch['actor_goal_observations'] = self.get_observations(actor_goal_idxs)
+            else:
+                batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
             if self.config.get('use_dual_value_goals', False):
                 batch['value_goal_observations_intraj'] = self.get_observations(value_goal_idxs)
                 batch['value_goal_observations_cf'] = self.get_observations(value_goal_idxs_cf)
