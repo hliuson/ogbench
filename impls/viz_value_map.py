@@ -40,9 +40,11 @@ flags.DEFINE_string('output', None, 'Output path (default: <exp_dir>/value_map.p
 flags.DEFINE_string('start_cells', None, 'Semicolon-separated start cells as i,j pairs e.g. "1,1;5,5".')
 flags.DEFINE_string('exp_labels', None, 'Comma-separated labels for experiments (default: inferred from path).')
 flags.DEFINE_bool('show_steps', False, 'Show implied step distance log(V)/log(discount) instead of raw V.')
+flags.DEFINE_bool('show_std', False, 'Show standard deviation across repeated goal-pose samples instead of the mean value map.')
 flags.DEFINE_float('discount', 0.995, 'Discount factor (used for step conversion when --show_steps).')
 flags.DEFINE_integer('max_steps', 1000, 'Clamp step distance display at this value.')
 flags.DEFINE_integer('n_goal_samples', 1, 'Number of robot poses to sample and average per goal cell.')
+flags.DEFINE_string('metrics_output', None, 'Optional JSON path for value-map geometry metrics.')
 
 
 def extract_exp_name(exp_dir):
@@ -65,6 +67,12 @@ def load_agent(exp_dir, epoch, env):
         from agents.latent_trl import LatentTRLAgent as AgentClass
     elif agent_name == 'trl':
         from agents.trl import TRLAgent as AgentClass
+    elif agent_name == 'vae_trl':
+        from agents.vae_trl import VaeTRLAgent as AgentClass
+    elif agent_name == 'ltrl_sharsa':
+        from agents.ltrl_sharsa import LTRLSHARSAAgent as AgentClass
+    elif agent_name == 'ltrl_hiql':
+        from agents.ltrl_hiql import LTRLHIQLAgent as AgentClass
     else:
         raise ValueError(f'Unknown agent: {agent_name}')
 
@@ -168,10 +176,17 @@ def get_values(agent, s_batch, goal_obs):
     agent_name = agent.config['agent_name']
 
     if agent_name == 'latent_trl':
-        v_logits = agent.network.select('value')(
-            jnp.array(s_batch),
-            goals=jnp.array(goal_obs),
-        )
+        u_s = agent._encode_state(jnp.array(s_batch))
+        u_g = agent._encode_state(jnp.array(goal_obs))
+        v_logits = agent.network.select('value')(u_s, goals=u_g)
+        vs = jax.nn.sigmoid(v_logits)
+        v_min = jnp.minimum(vs[0], vs[1])
+        return np.array(v_min)
+
+    elif agent_name in ('vae_trl', 'ltrl_sharsa', 'ltrl_hiql'):
+        z_s = agent._encode(jnp.array(s_batch))
+        z_g = agent._encode(jnp.array(goal_obs))
+        v_logits = agent.network.select('value')(z_s, goals=z_g)
         vs = jax.nn.sigmoid(v_logits)
         v_min = jnp.minimum(vs[0], vs[1])
         return np.array(v_min)
@@ -200,24 +215,68 @@ def get_values(agent, s_batch, goal_obs):
         raise ValueError(f'Unknown agent type: {agent_name}')
 
 
-def evaluate_values(agent, start_obs, goal_obs):
+def evaluate_value_samples(agent, start_obs, goal_obs):
     """Evaluate V(s, g) for a fixed s and precomputed goal observations.
 
-    If goal_obs has shape (n_samples, n_goals, ob_dim), averages values across samples.
-    If goal_obs has shape (n_goals, ob_dim), evaluates directly.
+    Returns:
+        values with shape (n_samples, n_goals). If only one sample is provided,
+        returns shape (1, n_goals).
     """
     if goal_obs.ndim == 3:
-        # Multiple samples: evaluate each and average.
         n_samples, n_goals, _ = goal_obs.shape
-        all_values = np.zeros(n_goals, dtype=np.float32)
+        all_values = np.zeros((n_samples, n_goals), dtype=np.float32)
         for s in range(n_samples):
             s_batch = np.tile(start_obs, (n_goals, 1))
-            all_values += get_values(agent, s_batch, goal_obs[s])
-        return all_values / n_samples
+            all_values[s] = get_values(agent, s_batch, goal_obs[s])
+        return all_values
     else:
         n_goals = len(goal_obs)
         s_batch = np.tile(start_obs, (n_goals, 1))
-        return get_values(agent, s_batch, goal_obs)
+        return get_values(agent, s_batch, goal_obs)[None, ...]
+
+
+def implied_distance(values, discount):
+    """Convert values in (0, 1] to implied step distance."""
+    return -np.log(np.clip(values, 1e-8, 1.0)) / (-np.log(discount))
+
+
+def summarize_array(values):
+    values = np.asarray(values)
+    if values.size == 0:
+        return dict(mean=float('nan'), p95=float('nan'), max=float('nan'))
+    return dict(
+        mean=float(np.mean(values)),
+        p95=float(np.percentile(values, 95)),
+        max=float(np.max(values)),
+    )
+
+
+def compute_grid_metrics(value_samples, mask, resolution, discount):
+    """Compute local geometry metrics for a grid of values."""
+    mean_values = value_samples.mean(axis=0)
+    mean_map = np.full((resolution, resolution), np.nan, dtype=np.float32)
+    mean_map[mask] = mean_values
+
+    d_map = implied_distance(mean_map, discount)
+
+    horiz_valid = mask[:, :-1] & mask[:, 1:]
+    vert_valid = mask[:-1, :] & mask[1:, :]
+    horiz_diffs = np.abs(d_map[:, :-1] - d_map[:, 1:])[horiz_valid]
+    vert_diffs = np.abs(d_map[:-1, :] - d_map[1:, :])[vert_valid]
+    neighbor_diffs = np.concatenate([horiz_diffs, vert_diffs], axis=0)
+    neighbor_violations = np.maximum(neighbor_diffs - 1.0, 0.0)
+
+    metrics = {
+        'neighbor_step_delta': summarize_array(neighbor_diffs),
+        'neighbor_one_step_violation': summarize_array(neighbor_violations),
+        'neighbor_one_step_violation_frac': float(np.mean(neighbor_diffs > 1.0)) if neighbor_diffs.size else float('nan'),
+    }
+
+    if value_samples.shape[0] > 1:
+        std_values = value_samples.std(axis=0)
+        metrics['goal_pose_std'] = summarize_array(std_values)
+
+    return metrics
 
 
 def draw_maze_walls(ax, maze_map, maze_unit, offset_x, offset_y):
@@ -261,20 +320,42 @@ def plot_value_maps_comparison(agents, exp_names, env, maze_map, maze_unit,
             axes[r, c] = fig.add_subplot(gs[r, c])
 
     show_steps = FLAGS.show_steps
+    show_std = FLAGS.show_std
     discount = FLAGS.discount
     max_steps = FLAGS.max_steps
 
     im = None
+    all_metrics = {}
     for row, (si, sj) in enumerate(start_cells):
         sx, sy = sj * maze_unit - offset_x, si * maze_unit - offset_y
         start_obs = make_observation_at_xy(env, [sx, sy])
+        start_key = f'start_{si}_{sj}'
+        all_metrics[start_key] = {}
 
         for col, (agent, name) in enumerate(zip(agents, exp_names)):
             ax = axes[row, col]
             print(f'Evaluating {name} from cell ({si},{sj})...')
-            values = evaluate_values(agent, start_obs, goal_obs)
+            value_samples = evaluate_value_samples(agent, start_obs, goal_obs)
+            values = value_samples.mean(axis=0)
+            metrics = compute_grid_metrics(value_samples, mask, resolution, discount)
+            all_metrics[start_key][name] = metrics
+            print(
+                f"  {name} local metrics: "
+                f"delta_mean={metrics['neighbor_step_delta']['mean']:.3f}, "
+                f"viol_mean={metrics['neighbor_one_step_violation']['mean']:.3f}, "
+                f"viol_frac={metrics['neighbor_one_step_violation_frac']:.3f}"
+            )
 
-            if show_steps:
+            if show_std:
+                display_values = value_samples.std(axis=0)
+                display_map = np.full(xx.shape, np.nan)
+                display_map[mask] = display_values
+                cmap = 'magma'
+                vmin, vmax = 0, np.nanmax(display_map)
+                if not np.isfinite(vmax) or vmax <= 0:
+                    vmax = 1e-6
+                cbar_label = 'Std[V(s, g)] across goal-pose samples'
+            elif show_steps:
                 # Convert V to implied step distance, clamped.
                 steps = np.log(np.clip(values, 1e-8, 1.0)) / np.log(discount)
                 steps = np.clip(steps, 0, max_steps)
@@ -317,6 +398,14 @@ def plot_value_maps_comparison(agents, exp_names, env, maze_map, maze_unit,
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
     print(f'Saved to {output_path}')
     plt.close()
+
+    metrics_output = FLAGS.metrics_output
+    if metrics_output is None:
+        output_path_obj = pathlib.Path(output_path)
+        metrics_output = str(output_path_obj.with_name(f'{output_path_obj.stem}_metrics.json'))
+    with open(metrics_output, 'w') as f:
+        json.dump(all_metrics, f, indent=2)
+    print(f'Saved metrics to {metrics_output}')
 
 
 def main(_):

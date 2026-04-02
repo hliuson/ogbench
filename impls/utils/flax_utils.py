@@ -202,6 +202,63 @@ def restore_agent(agent, restore_path, restore_epoch):
     return agent
 
 
+def restore_agent_params_partial(agent, restore_path, restore_epoch, include_modules=None):
+    """Restore a subset of parameter modules from a saved agent checkpoint.
+
+    This keeps the current optimizer state and only overwrites shape-compatible
+    parameter subtrees at the top-level module granularity.
+
+    Args:
+        agent: Freshly created agent whose params will be partially overwritten.
+        restore_path: Directory or glob pointing to the source experiment dir.
+        restore_epoch: Checkpoint epoch number.
+        include_modules: Optional iterable of top-level param keys to restore.
+            Example: ['modules_vae_encoder', 'modules_value'].
+
+    Returns:
+        Tuple of (new_agent, restored_modules).
+    """
+    candidates = glob.glob(restore_path)
+
+    assert len(candidates) == 1, f'Found {len(candidates)} candidates: {candidates}'
+
+    restore_path = candidates[0] + f'/params_{restore_epoch}.pkl'
+
+    with open(restore_path, 'rb') as f:
+        load_dict = pickle.load(f)
+
+    loaded_params = load_dict['agent']['network']['params']
+    current_params = agent.network.params
+
+    current_is_frozen = isinstance(current_params, flax.core.FrozenDict)
+    current_dict = flax.core.unfreeze(current_params) if current_is_frozen else current_params
+    loaded_dict = flax.core.unfreeze(loaded_params) if isinstance(loaded_params, flax.core.FrozenDict) else loaded_params
+
+    if include_modules is None:
+        include_modules = sorted(set(current_dict.keys()) & set(loaded_dict.keys()))
+    else:
+        include_modules = list(include_modules)
+
+    restored_modules = []
+    for module_name in include_modules:
+        if module_name not in current_dict:
+            raise ValueError(f'Module {module_name} not found in current params.')
+        if module_name not in loaded_dict:
+            raise ValueError(f'Module {module_name} not found in checkpoint params.')
+        if not _tree_matches(current_dict[module_name], loaded_dict[module_name]):
+            raise ValueError(f'Module {module_name} is not shape-compatible with checkpoint.')
+        current_dict[module_name] = loaded_dict[module_name]
+        restored_modules.append(module_name)
+
+    if current_is_frozen:
+        current_dict = flax.core.freeze(current_dict)
+
+    agent = agent.replace(network=agent.network.replace(params=current_dict))
+    print(f'Partially restored from {restore_path}')
+    print(f'  Restored modules: {restored_modules}')
+    return agent, restored_modules
+
+
 def save_pretrain_state(state, target_params, save_dir, step, prefix='pretrain'):
     """Save a pretraining state and target parameters to a file."""
     save_dict = dict(

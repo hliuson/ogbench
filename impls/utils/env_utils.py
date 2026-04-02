@@ -76,12 +76,16 @@ class FrameStackWrapper(gymnasium.Wrapper):
         return self.get_observation(), reward, terminated, truncated, info
 
 
-def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None):
+def make_env_and_datasets(dataset_name, frame_stack=None, dataset_path=None, shard_cache_size=None):
     """Make OGBench environment and datasets.
 
     Args:
         dataset_name: Name of the dataset.
         frame_stack: Number of frames to stack.
+        dataset_path: Optional dataset path override.
+        shard_cache_size: Accepted for compatibility with scripts that support
+            streamed datasets. The current OGBench utility path loads datasets
+            eagerly, so this argument is intentionally ignored here.
 
     Returns:
         A tuple of the environment, training dataset, and validation dataset.

@@ -25,7 +25,11 @@ flags.DEFINE_string('run_group', 'VAE', 'Run group.')
 flags.DEFINE_string('wandb_project', 'OGBench-VAE', 'Weights & Biases project.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'visual-antmaze-large-navigate-v0', 'Environment (dataset) name.')
-flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
+flags.DEFINE_string(
+    'save_dir',
+    '/scratch/engin_root/engin1/hliuson/ogbench_exp',
+    'Save directory.',
+)
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_step', None, 'Restore step.')
 flags.DEFINE_string('dataset_path', None, 'Optional dataset path override.')
@@ -54,10 +58,12 @@ def _ensure_dataset(dataset):
     return Dataset.create(**dataset)
 
 
+def _is_streaming_observations(observations):
+    return type(observations).__name__ == 'ShardedArray' or hasattr(observations, 'shard_paths')
+
+
 def _resolve_preprocess_frame_stack(*datasets):
-    streaming = any(
-        isinstance(ds['observations'], ShardedArray) for ds in datasets if ds is not None
-    )
+    streaming = any(_is_streaming_observations(ds['observations']) for ds in datasets if ds is not None)
     if streaming and FLAGS.preprocess_frame_stack:
         print('Streaming dataset detected; disabling preprocess_frame_stack to avoid full preload.')
         return False

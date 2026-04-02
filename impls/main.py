@@ -16,7 +16,14 @@ from ml_collections import config_flags
 from utils.datasets import Dataset, GCDataset, HGCDataset
 from utils.env_utils import make_env_and_datasets
 from utils.evaluation import evaluate
-from utils.flax_utils import inject_encoder_params, load_encoder_params, print_param_tree, restore_agent, save_agent
+from utils.flax_utils import (
+    inject_encoder_params,
+    load_encoder_params,
+    print_param_tree,
+    restore_agent,
+    restore_agent_params_partial,
+    save_agent,
+)
 from utils.log_utils import CsvLogger, get_exp_name, get_flag_dict, get_wandb_video, setup_wandb
 
 FLAGS = flags.FLAGS
@@ -24,10 +31,21 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('run_group', 'Debug', 'Run group.')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'antmaze-large-navigate-v0', 'Environment (dataset) name.')
-flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
+flags.DEFINE_string(
+    'save_dir',
+    '/scratch/engin_root/engin1/hliuson/ogbench_exp',
+    'Save directory.',
+)
 flags.DEFINE_string('restore_path', None, 'Restore path.')
 flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_string('dataset_path', None, 'Optional dataset path override.')
+flags.DEFINE_string('partial_restore_path', None, 'Restore path for partial module restore.')
+flags.DEFINE_integer('partial_restore_epoch', None, 'Restore epoch for partial module restore.')
+flags.DEFINE_list(
+    'partial_restore_modules',
+    None,
+    'Optional top-level network param modules to restore, e.g. modules_vae_encoder,modules_value.',
+)
 flags.DEFINE_string('encoder_restore_path', None, 'Restore path for encoder params.')
 flags.DEFINE_integer('encoder_restore_step', None, 'Restore step for encoder params.')
 flags.DEFINE_string('encoder_restore_prefix', 'encoder', 'Prefix for encoder params files.')
@@ -153,6 +171,21 @@ def main(_):
     # Restore agent.
     if FLAGS.restore_path is not None:
         agent = restore_agent(agent, FLAGS.restore_path, FLAGS.restore_epoch)
+    if FLAGS.partial_restore_path is not None:
+        if FLAGS.partial_restore_epoch is None:
+            raise ValueError('partial_restore_epoch must be set when partial_restore_path is provided.')
+        agent, restored_modules = restore_agent_params_partial(
+            agent,
+            FLAGS.partial_restore_path,
+            FLAGS.partial_restore_epoch,
+            include_modules=FLAGS.partial_restore_modules,
+        )
+        print('\n' + '=' * 60)
+        print('Partial Restore Summary:')
+        print(f'  Source: {FLAGS.partial_restore_path}')
+        print(f'  Epoch: {FLAGS.partial_restore_epoch}')
+        print(f'  Modules: {restored_modules}')
+        print('=' * 60 + '\n')
     if FLAGS.encoder_restore_path is not None:
         if FLAGS.encoder_restore_step is None:
             raise ValueError('encoder_restore_step must be set when encoder_restore_path is provided.')
@@ -200,8 +233,13 @@ def main(_):
 
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
-        # Pass step to agents that support it (e.g., for warmup schedules)
-        if 'high_actor_warmup_steps' in config or 'cf_warmup_steps' in config or 'cf_burnin_steps' in config:
+        # Pass step to agents that support schedule-dependent behavior.
+        if (
+            'high_actor_warmup_steps' in config
+            or 'cf_warmup_steps' in config
+            or 'cf_burnin_steps' in config
+            or 'value_goal_warmup_steps' in config
+        ):
             agent, update_info = agent.update(batch, step=i)
         else:
             agent, update_info = agent.update(batch)
@@ -211,7 +249,12 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                if 'high_actor_warmup_steps' in config or 'cf_warmup_steps' in config or 'cf_burnin_steps' in config:
+                if (
+                    'high_actor_warmup_steps' in config
+                    or 'cf_warmup_steps' in config
+                    or 'cf_burnin_steps' in config
+                    or 'value_goal_warmup_steps' in config
+                ):
                     _, val_info = agent.total_loss(val_batch, grad_params=None, step=i)
                 else:
                     _, val_info = agent.total_loss(val_batch, grad_params=None)

@@ -337,27 +337,31 @@ class GCValue(nn.Module):
     ensemble: bool = True
     num_ensembles: int = None
     gc_encoder: nn.Module = None
+    enable_features: bool = False
 
     def setup(self):
         mlp_module = self.mlp_class
         num_ensembles = self.num_ensembles
         if num_ensembles is None:
             num_ensembles = 2 if self.ensemble else 1
-        if num_ensembles > 1:
-            mlp_module = ensemblize(mlp_module, num_ensembles)
-        output_dim = self.output_dim if self.output_dim is not None else 1
-        value_net = mlp_module((*self.hidden_dims, output_dim), activate_final=False, layer_norm=self.layer_norm)
+        if self.enable_features:
+            # Split into trunk (hidden layers) + head (output layer) for feature extraction.
+            trunk_module = self.mlp_class
+            if num_ensembles > 1:
+                trunk_module = ensemblize(trunk_module, num_ensembles)
+            self.trunk = trunk_module(self.hidden_dims, activate_final=True, layer_norm=self.layer_norm)
+            output_dim = self.output_dim if self.output_dim is not None else 1
+            head_module = self.mlp_class
+            if num_ensembles > 1:
+                head_module = ensemblize(head_module, num_ensembles)
+            self.head = head_module((output_dim,), activate_final=False, layer_norm=False)
+        else:
+            if num_ensembles > 1:
+                mlp_module = ensemblize(mlp_module, num_ensembles)
+            output_dim = self.output_dim if self.output_dim is not None else 1
+            self.value_net = mlp_module((*self.hidden_dims, output_dim), activate_final=False, layer_norm=self.layer_norm)
 
-        self.value_net = value_net
-
-    def __call__(self, observations, goals=None, actions=None):
-        """Return the value/critic function.
-
-        Args:
-            observations: Observations.
-            goals: Goals (optional).
-            actions: Actions (optional).
-        """
+    def _prepare_inputs(self, observations, goals=None, actions=None):
         if self.gc_encoder is not None:
             if goals is None:
                 inputs = [self.gc_encoder(observations)]
@@ -369,13 +373,91 @@ class GCValue(nn.Module):
                 inputs.append(goals)
         if actions is not None:
             inputs.append(actions)
-        inputs = jnp.concatenate(inputs, axis=-1)
+        return jnp.concatenate(inputs, axis=-1)
 
-        v = self.value_net(inputs)
-        if self.output_dim is None:
-            v = v.squeeze(-1)
+    def __call__(self, observations, goals=None, actions=None, return_features=False):
+        """Return the value/critic function.
 
-        return v
+        Args:
+            observations: Observations.
+            goals: Goals (optional).
+            actions: Actions (optional).
+            return_features: If True, also return last hidden layer features.
+        """
+        inputs = self._prepare_inputs(observations, goals, actions)
+
+        if self.enable_features:
+            features = self.trunk(inputs)
+            v = self.head(features)
+            if self.output_dim is None:
+                v = v.squeeze(-1)
+            if return_features:
+                return v, features
+            return v
+        else:
+            v = self.value_net(inputs)
+            if self.output_dim is None:
+                v = v.squeeze(-1)
+            return v
+
+
+class UnifiedGCValue(nn.Module):
+    """Unified goal-conditioned value with shared obs_head and z_head.
+
+    Supports three modes:
+      'sg': V(s, g) = trunk(obs_head(s), obs_head(g))
+      'sz': V(s, z) = trunk(obs_head(s), z_head(z))
+      'zg': V(z, g) = trunk(z_head(z), obs_head(g))
+
+    Heads are plain MLPs; the trunk is ensemblized.
+    """
+
+    hidden_dims: Sequence[int]
+    head_dim: int = 256
+    layer_norm: bool = True
+    num_ensembles: int = 2
+
+    def setup(self):
+        self.obs_head = MLP((self.head_dim,), activate_final=True, layer_norm=self.layer_norm)
+        self.z_head = MLP((self.head_dim,), activate_final=True, layer_norm=self.layer_norm)
+        trunk_mlp = MLP
+        if self.num_ensembles > 1:
+            trunk_mlp = ensemblize(trunk_mlp, self.num_ensembles)
+        self.trunk = trunk_mlp((*self.hidden_dims, 1), activate_final=False, layer_norm=self.layer_norm)
+
+    def __call__(self, observations, goals, z, mode='sg'):
+        if self.is_initializing():
+            # Touch every path once during init so all params are registered.
+            obs_feat = self.obs_head(observations)
+            goal_feat = self.obs_head(goals)
+            z_feat = self.z_head(z)
+        elif mode == 'sg':
+            obs_feat = self.obs_head(observations)
+            goal_feat = self.obs_head(goals)
+            h = jnp.concatenate([obs_feat, goal_feat], axis=-1)
+        elif mode == 'sz':
+            obs_feat = self.obs_head(observations)
+            z_feat = self.z_head(z)
+            h = jnp.concatenate([obs_feat, z_feat], axis=-1)
+        elif mode == 'zg':
+            goal_feat = self.obs_head(goals)
+            z_feat = self.z_head(z)
+            h = jnp.concatenate([z_feat, goal_feat], axis=-1)
+        else:
+            raise ValueError(f'Unknown mode: {mode}')
+
+        if self.is_initializing():
+            if mode == 'sg':
+                h = jnp.concatenate([obs_feat, goal_feat], axis=-1)
+            elif mode == 'sz':
+                h = jnp.concatenate([obs_feat, z_feat], axis=-1)
+            elif mode == 'zg':
+                h = jnp.concatenate([z_feat, goal_feat], axis=-1)
+            else:
+                raise ValueError(f'Unknown mode: {mode}')
+
+        v = self.trunk(h)
+        return v.squeeze(-1)
 
 
 class GCDiscreteCritic(GCValue):

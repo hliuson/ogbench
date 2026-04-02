@@ -26,3 +26,9 @@ nohup.out
 .claude/
 CLAUDE.md
 EXPERIMENTS.md
+
+# Local artifacts
+.codex
+impls/analysis/
+EXPERIMENTS.archive.*
+HIERARCHICAL_POLICY_EXTRACTION.md
