@@ -125,7 +125,6 @@ run_latent_trl() {
   local seed="$3"
   local run_group="$4"
   local dataset_replace_interval="$5"
-  local q_short_n_step="$6"
   run_main "${env_name}" "${dataset_path}" "${seed}" agents/latent_trl.py "${run_group}" "${dataset_replace_interval}" \
     --agent.batch_size=1024 \
     --agent.discount=0.999 \
@@ -150,7 +149,7 @@ run_latent_trl() {
     --agent.actor_p_randomgoal=0.5 \
     --agent.sigreg_coef=0.001 \
     --agent.cf_expectile=0.7 \
-    --agent.q_short_n_step="${q_short_n_step}" \
+    --agent.q_short_n_step=25 \
     --agent.z_proposal_awr_beta=1.0 \
     --agent.z_proposal_awr_max_weight=20.0 \
     --agent.z_proposal_awr_num_random_support=1 \
@@ -168,7 +167,7 @@ for seed in "${SEEDS[@]}"; do
   run_trl   puzzle-4x6-play-oraclerep-v0              "${DATA_DIR}/puzzle-4x6-play-100m-v0"              "${seed}" trl-p46-100m            1000
   run_mc    puzzle-4x6-play-oraclerep-v0              "${DATA_DIR}/puzzle-4x6-play-100m-v0"              "${seed}" mc-p46-100m             1000
   run_gciql puzzle-4x6-play-oraclerep-v0              "${DATA_DIR}/puzzle-4x6-play-100m-v0"              "${seed}" gciql-p46-100m          1000
-  run_latent_trl puzzle-4x6-play-oraclerep-v0         "${DATA_DIR}/puzzle-4x6-play-100m-v0"              "${seed}" ltrl-p46-100m           1000 1
+  run_latent_trl puzzle-4x6-play-oraclerep-v0         "${DATA_DIR}/puzzle-4x6-play-100m-v0"              "${seed}" ltrl-p46-100m           1000
 
 done
 
@@ -176,7 +175,7 @@ for seed in "${SEEDS[@]}"; do
   run_trl   cube-triple-play-oraclerep-v0             "${DATA_DIR}/cube-triple-play-100m-v0"             "${seed}" trl-ct-100m             1000
   run_mc    cube-triple-play-oraclerep-v0             "${DATA_DIR}/cube-triple-play-100m-v0"             "${seed}" mc-ct-100m              1000
   run_gciql cube-triple-play-oraclerep-v0             "${DATA_DIR}/cube-triple-play-100m-v0"             "${seed}" gciql-ct-100m           1000
-  run_latent_trl cube-triple-play-oraclerep-v0        "${DATA_DIR}/cube-triple-play-100m-v0"             "${seed}" ltrl-ct-100m            1000 25
+  run_latent_trl cube-triple-play-oraclerep-v0        "${DATA_DIR}/cube-triple-play-100m-v0"             "${seed}" ltrl-ct-100m            1000
 
 done
 
@@ -184,6 +183,6 @@ for seed in "${SEEDS[@]}"; do
   run_trl   humanoidmaze-giant-navigate-oraclerep-v0  "${DATA_DIR}/humanoidmaze-giant-navigate-100m-v0"  "${seed}" trl-hmg-nav-100m        100000
   run_mc    humanoidmaze-giant-navigate-oraclerep-v0  "${DATA_DIR}/humanoidmaze-giant-navigate-100m-v0"  "${seed}" mc-hmg-nav-100m         100000
   run_gciql humanoidmaze-giant-navigate-oraclerep-v0  "${DATA_DIR}/humanoidmaze-giant-navigate-100m-v0"  "${seed}" gciql-hmg-nav-100m      100000
-  run_latent_trl humanoidmaze-giant-navigate-oraclerep-v0 "${DATA_DIR}/humanoidmaze-giant-navigate-100m-v0" "${seed}" ltrl-hmg-nav-100m     100000 25
+  run_latent_trl humanoidmaze-giant-navigate-oraclerep-v0 "${DATA_DIR}/humanoidmaze-giant-navigate-100m-v0" "${seed}" ltrl-hmg-nav-100m     100000
 
 done
