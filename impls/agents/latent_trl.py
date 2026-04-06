@@ -1010,12 +1010,12 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         z_samples = imf_one_shot_sample(rng, sample_shape, vector_field_fn)
         return z_samples
 
-    def q_short_loss(self, batch, grad_params, policy_ctx=None):
+    def q_action_loss(self, batch, grad_params, policy_ctx=None):
         """Distill Q_short(s, g, a) from an n-step bootstrap into V for FRS action selection."""
-        q_short_goal_key = 'actor_goals'
+        q_action_goal_key = 'actor_goals'
         target_goal_key = 'actor_goal_observations'
-        q_short_n_step = int(self.config.get('q_short_n_step', 1))
-        next_obs_key = 'actor_nstep_observations' if q_short_n_step > 1 and 'actor_nstep_observations' in batch else 'next_observations'
+        q_action_n_step = int(self.config.get('q_action_n_step', 1))
+        next_obs_key = 'actor_nstep_observations' if q_action_n_step > 1 and 'actor_nstep_observations' in batch else 'next_observations'
         u_next = self._encode_state(batch[next_obs_key])
         u_g = policy_ctx['actor_goal_u'] if policy_ctx is not None else self._encode_state(batch[target_goal_key])
 
@@ -1025,13 +1025,13 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         )
         v_next = jax.nn.sigmoid(v_next_logits)
         v_next_min = jnp.minimum(v_next[0], v_next[1])
-        if q_short_n_step > 1 and 'actor_nstep_steps' in batch:
+        if q_action_n_step > 1 and 'actor_nstep_steps' in batch:
             n_steps = batch['actor_nstep_steps']
         else:
             n_steps = jnp.ones_like(batch['actions'][..., 0], dtype=jnp.int32)
         bootstrap_target = (self.config['discount'] ** n_steps) * v_next_min
 
-        if q_short_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
+        if q_action_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
             actor_is_intraj = batch['actor_goals_is_intraj']
             actor_goal_offsets = batch['actor_goal_offsets']
             exact_reached = actor_is_intraj * (actor_goal_offsets <= n_steps)
@@ -1042,31 +1042,31 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             target = bootstrap_target
 
         if policy_ctx is None:
-            q_short_observations, q_short_goals = self._encode_policy_inputs(
+            q_action_observations, q_action_goals = self._encode_policy_inputs(
                 batch['observations'],
-                batch[q_short_goal_key],
+                batch[q_action_goal_key],
                 grad_params=grad_params,
             )
         else:
-            q_short_observations = policy_ctx['actor_observations']
-            q_short_goals = policy_ctx['actor_goals']
-        q_short_logits = self.network.select('q_short')(
-            q_short_observations,
-            goals=q_short_goals,
+            q_action_observations = policy_ctx['actor_observations']
+            q_action_goals = policy_ctx['actor_goals']
+        q_action_logits = self.network.select('q_action')(
+            q_action_observations,
+            goals=q_action_goals,
             actions=batch['actions'],
             params=grad_params,
         )
-        q_short = jax.nn.sigmoid(q_short_logits)
+        q_action = jax.nn.sigmoid(q_action_logits)
 
-        q_short_loss = self.bce_loss(q_short_logits, jax.lax.stop_gradient(target)).mean()
+        q_action_loss = self.bce_loss(q_action_logits, jax.lax.stop_gradient(target)).mean()
 
-        return q_short_loss, {
-            'q_short_loss': q_short_loss,
-            'q_short_mean': q_short.mean(),
-            'q_short_max': q_short.max(),
-            'q_short_min': q_short.min(),
+        return q_action_loss, {
+            'q_action_loss': q_action_loss,
+            'q_action_mean': q_action.mean(),
+            'q_action_max': q_action.max(),
+            'q_action_min': q_action.min(),
             'v_next_target_mean': target.mean(),
-            'n_step': jnp.asarray(q_short_n_step, dtype=jnp.float32),
+            'n_step': jnp.asarray(q_action_n_step, dtype=jnp.float32),
             'exact_reached_frac': exact_reached.mean(),
         }
 
@@ -1250,9 +1250,9 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             for k, v in midpoint_sigreg_info.items():
                 info[f'sigreg/{k}'] = v
 
-        q_short_loss, q_short_info = self.q_short_loss(batch, grad_params, policy_ctx=policy_ctx)
-        for k, v in q_short_info.items():
-            info[f'q_short/{k}'] = v
+        q_action_loss, q_action_info = self.q_action_loss(batch, grad_params, policy_ctx=policy_ctx)
+        for k, v in q_action_info.items():
+            info[f'q_action/{k}'] = v
 
         actor_loss, actor_info = self.actor_loss(batch, grad_params, rng=actor_rng, policy_ctx=policy_ctx)
         for k, v in actor_info.items():
@@ -1265,7 +1265,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             + self.config['z_proposal_coef'] * z_proposal_loss
             + self.config.get('midpoint_decoder_coef', 0.0) * midpoint_decoder_loss
             + self.config.get('sigreg_coef', 0.0) * midpoint_sigreg_loss
-            + q_short_loss
+            + q_action_loss
             + actor_loss
         )
         return loss, info
@@ -1325,16 +1325,16 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
                 n_actions = n_actions + vels / pe_info['flow_steps']
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            q_short = self.network.select('q_short')(
+            q_action = self.network.select('q_action')(
                 n_observations,
                 goals=n_goals,
                 actions=n_actions,
             )
 
             if len(observations.shape) == 2:
-                actions = n_actions[jnp.argmax(q_short, axis=0), jnp.arange(observations.shape[0])]
+                actions = n_actions[jnp.argmax(q_action, axis=0), jnp.arange(observations.shape[0])]
             else:
-                actions = n_actions[jnp.argmax(q_short)]
+                actions = n_actions[jnp.argmax(q_action)]
 
             return actions
 
@@ -1415,7 +1415,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
-        q_short_def = GCValue(
+        q_action_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=1,
@@ -1474,7 +1474,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             target_value=(copy.deepcopy(value_def), (ex_u, ex_u)),
             q=(q_def, (ex_u, ex_u, ex_z)),
             target_q=(copy.deepcopy(q_def), (ex_u, ex_u, ex_z)),
-            q_short=(q_short_def, (ex_encoded_observations, ex_encoded_goals, ex_actions)),
+            q_action=(q_action_def, (ex_encoded_observations, ex_encoded_goals, ex_actions)),
             z_proposal=(z_proposal_def, (ex_u, ex_u, ex_z, ex_z_times)),
             actor=(actor_def, ex_actor_in),
             midpoint_decoder=(
@@ -1554,7 +1554,7 @@ def get_config():
             value_goal_mix_start_randomgoal=0.0,
             sigreg_coef=0.0,
             sigreg_num_slices=32,
-            q_short_n_step=1,
+            q_action_n_step=1,
             actor_p_curgoal=0.0,
             actor_p_trajgoal=0.5,
             actor_p_randomgoal=0.5,

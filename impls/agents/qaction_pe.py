@@ -4,8 +4,8 @@ import jax
 import jax.numpy as jnp
 
 
-class QShortPolicyExtractionMixin:
-    """Shared q_short + actor policy extraction used by lightweight baselines."""
+class QActionPolicyExtractionMixin:
+    """Shared q_action + actor policy extraction used by lightweight baselines."""
 
     @staticmethod
     def _get_pe_info_from_config(config):
@@ -22,12 +22,12 @@ class QShortPolicyExtractionMixin:
         log_not_pred = jax.nn.log_sigmoid(-pred_logit)
         return -(log_pred * target + log_not_pred * (1 - target))
 
-    def q_short_loss(self, batch, grad_params):
-        """Distill q_short(s, a, g) from an n-step bootstrap into target value."""
-        q_short_n_step = int(self.config.get('q_short_n_step', 1))
+    def q_action_loss(self, batch, grad_params):
+        """Distill q_action(s, a, g) from an n-step bootstrap into target value."""
+        q_action_n_step = int(self.config.get('q_action_n_step', 1))
         next_obs_key = (
             'actor_nstep_observations'
-            if q_short_n_step > 1 and 'actor_nstep_observations' in batch
+            if q_action_n_step > 1 and 'actor_nstep_observations' in batch
             else 'next_observations'
         )
         next_observations = batch[next_obs_key]
@@ -38,13 +38,13 @@ class QShortPolicyExtractionMixin:
         if v_next.ndim > 1:
             v_next = jnp.minimum(v_next[0], v_next[1])
 
-        if q_short_n_step > 1 and 'actor_nstep_steps' in batch:
+        if q_action_n_step > 1 and 'actor_nstep_steps' in batch:
             n_steps = batch['actor_nstep_steps']
         else:
             n_steps = jnp.ones_like(batch['actions'][..., 0], dtype=jnp.int32)
         bootstrap_target = (self.config['discount'] ** n_steps) * v_next
 
-        if q_short_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
+        if q_action_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
             actor_is_intraj = batch['actor_goals_is_intraj']
             actor_goal_offsets = batch['actor_goal_offsets']
             exact_reached = actor_is_intraj * (actor_goal_offsets <= n_steps)
@@ -54,22 +54,22 @@ class QShortPolicyExtractionMixin:
             exact_reached = jnp.zeros_like(bootstrap_target)
             target = bootstrap_target
 
-        q_short_logits = self.network.select('q_short')(
+        q_action_logits = self.network.select('q_action')(
             batch['observations'],
             goals=actor_goals,
             actions=batch['actions'],
             params=grad_params,
         )
-        q_short = jax.nn.sigmoid(q_short_logits)
-        q_short_loss = self.bce_loss(q_short_logits, jax.lax.stop_gradient(target)).mean()
+        q_action = jax.nn.sigmoid(q_action_logits)
+        q_action_loss = self.bce_loss(q_action_logits, jax.lax.stop_gradient(target)).mean()
 
-        return q_short_loss, {
-            'q_short_loss': q_short_loss,
-            'q_short_mean': q_short.mean(),
-            'q_short_max': q_short.max(),
-            'q_short_min': q_short.min(),
+        return q_action_loss, {
+            'q_action_loss': q_action_loss,
+            'q_action_mean': q_action.mean(),
+            'q_action_max': q_action.max(),
+            'q_action_min': q_action.min(),
             'v_next_target_mean': target.mean(),
-            'n_step': jnp.asarray(q_short_n_step, dtype=jnp.float32),
+            'n_step': jnp.asarray(q_action_n_step, dtype=jnp.float32),
             'exact_reached_frac': exact_reached.mean(),
         }
 
@@ -129,7 +129,7 @@ class QShortPolicyExtractionMixin:
                 'actor_loss': actor_loss,
             }
 
-        raise ValueError(f"Unsupported pe_type for q_short baselines: {self.config['pe_type']}")
+        raise ValueError(f"Unsupported pe_type for q_action baselines: {self.config['pe_type']}")
 
     def target_update(self, network, module_name):
         new_target_params = jax.tree_util.tree_map(
@@ -169,14 +169,14 @@ class QShortPolicyExtractionMixin:
                 n_actions = n_actions + vels / pe_info['flow_steps']
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            q_short = self.network.select('q_short')(
+            q_action = self.network.select('q_action')(
                 n_observations,
                 goals=n_goals,
                 actions=n_actions,
             )
             if len(observations.shape) == 2:
-                return n_actions[jnp.argmax(q_short, axis=0), jnp.arange(observations.shape[0])]
-            return n_actions[jnp.argmax(q_short)]
+                return n_actions[jnp.argmax(q_action, axis=0), jnp.arange(observations.shape[0])]
+            return n_actions[jnp.argmax(q_action)]
 
         dist = self.network.select('actor')(observations, goals, temperature=temperature)
         actions = dist.sample(seed=seed)

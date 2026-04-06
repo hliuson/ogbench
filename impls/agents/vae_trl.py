@@ -11,6 +11,7 @@ from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.flows import imf_loss, imf_one_shot_sample
 from utils.networks import ActorVectorField, GCActor, GCDiscreteActor, GCValue, MLP
+from utils.pretraining import ImpalaDecoder
 
 
 class VAEEncoder(nn.Module):
@@ -190,10 +191,16 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
 
     def vae_loss(self, batch, grad_params, rng):
         """Variational bottleneck loss over observations and midpoints."""
-        obs = self._encode_visual(batch['observations'], grad_params=grad_params)
-        midpoints = self._encode_visual(batch['value_midpoint_observations'], grad_params=grad_params)
+        raw_obs = batch['observations']
+        raw_midpoints = batch['value_midpoint_observations']
+        obs = self._encode_visual(raw_obs, grad_params=grad_params)
+        midpoints = self._encode_visual(raw_midpoints, grad_params=grad_params)
         # Combine observations and midpoints for VAE training.
         all_obs = jnp.concatenate([obs, midpoints], axis=0)
+        if self._has_visual_encoder():
+            all_targets = jnp.concatenate([raw_obs, raw_midpoints], axis=0).astype(jnp.float32) / 255.0
+        else:
+            all_targets = all_obs
 
         mu, log_var = self.network.select('vae_encoder')(all_obs, params=grad_params)
 
@@ -205,7 +212,9 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         recon_coef = self.config.get('vae_recon_coef', 1.0)
         if recon_coef > 0:
             recon = self.network.select('vae_decoder')(z, params=grad_params)
-            recon_loss = jnp.mean((recon - all_obs) ** 2)
+            if self._has_visual_encoder():
+                recon = jax.nn.sigmoid(recon)
+            recon_loss = jnp.mean((recon - all_targets) ** 2)
         else:
             recon_loss = jnp.asarray(0.0, dtype=mu.dtype)
         kl_loss = -0.5 * jnp.mean(1 + log_var - mu ** 2 - jnp.exp(log_var))
@@ -597,17 +606,17 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def _sample_cf_midpoints(self, batch, rng, num_samples=1):
         return self._sample_z_proposal(batch, rng, num_samples=num_samples)
 
-    def q_short_loss(self, batch, grad_params, rng):
+    def q_action_loss(self, batch, grad_params, rng):
         """Distill Q_short from an n-step bootstrap into V for action selection."""
         z_s_rng, z_next_rng, z_g_rng = jax.random.split(rng, 3)
-        q_short_goal_key = 'actor_goals'
+        q_action_goal_key = 'actor_goals'
         target_goal_key = 'actor_goal_observations'
-        q_short_n_step = int(self.config.get('q_short_n_step', 1))
-        next_obs_key = 'actor_nstep_observations' if q_short_n_step > 1 and 'actor_nstep_observations' in batch else 'next_observations'
+        q_action_n_step = int(self.config.get('q_action_n_step', 1))
+        next_obs_key = 'actor_nstep_observations' if q_action_n_step > 1 and 'actor_nstep_observations' in batch else 'next_observations'
         z_s = self._encode_rl(batch['observations'], grad_params, 'observation', rng=z_s_rng)
         z_next = self._encode_rl(batch[next_obs_key], grad_params, 'observation', rng=z_next_rng)
         z_g_encoded = self._encode_rl(batch[target_goal_key], grad_params, 'goal', rng=z_g_rng)
-        if self.config.get('q_short_stopgrad_encoder', False):
+        if self.config.get('q_action_stopgrad_encoder', False):
             z_s = jax.lax.stop_gradient(z_s)
             z_next = jax.lax.stop_gradient(z_next)
             z_g_encoded = jax.lax.stop_gradient(z_g_encoded)
@@ -615,13 +624,13 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
         v_next_logits = self.network.select('target_value')(z_next, goals=z_g_encoded)
         v_next = jax.nn.sigmoid(v_next_logits)
         v_next_min = jnp.minimum(v_next[0], v_next[1])
-        if q_short_n_step > 1 and 'actor_nstep_steps' in batch:
+        if q_action_n_step > 1 and 'actor_nstep_steps' in batch:
             n_steps = batch['actor_nstep_steps']
         else:
             n_steps = jnp.ones_like(batch['actions'][..., 0], dtype=jnp.int32)
         bootstrap_target = (self.config['discount'] ** n_steps) * v_next_min
 
-        if q_short_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
+        if q_action_n_step > 1 and 'actor_goals_is_intraj' in batch and 'actor_goal_offsets' in batch:
             actor_is_intraj = batch['actor_goals_is_intraj']
             actor_goal_offsets = batch['actor_goal_offsets']
             exact_reached = actor_is_intraj * (actor_goal_offsets <= n_steps)
@@ -631,22 +640,22 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             exact_reached = jnp.zeros_like(bootstrap_target)
             target = bootstrap_target
 
-        q_short_goals = self._encode_policy_goals(batch[q_short_goal_key], grad_params=grad_params)
+        q_action_goals = self._encode_policy_goals(batch[q_action_goal_key], grad_params=grad_params)
 
-        q_short_logits = self.network.select('q_short')(
-            z_s, goals=q_short_goals, actions=batch['actions'], params=grad_params,
+        q_action_logits = self.network.select('q_action')(
+            z_s, goals=q_action_goals, actions=batch['actions'], params=grad_params,
         )
-        q_short = jax.nn.sigmoid(q_short_logits)
+        q_action = jax.nn.sigmoid(q_action_logits)
 
-        q_short_loss = self.bce_loss(q_short_logits, jax.lax.stop_gradient(target)).mean()
+        q_action_loss = self.bce_loss(q_action_logits, jax.lax.stop_gradient(target)).mean()
 
-        return q_short_loss, {
-            'q_short_loss': q_short_loss,
-            'q_short_mean': q_short.mean(),
-            'q_short_max': q_short.max(),
-            'q_short_min': q_short.min(),
+        return q_action_loss, {
+            'q_action_loss': q_action_loss,
+            'q_action_mean': q_action.mean(),
+            'q_action_max': q_action.max(),
+            'q_action_min': q_action.min(),
             'v_next_target_mean': target.mean(),
-            'n_step': jnp.asarray(q_short_n_step, dtype=jnp.float32),
+            'n_step': jnp.asarray(q_action_n_step, dtype=jnp.float32),
             'exact_reached_frac': exact_reached.mean(),
         }
 
@@ -728,7 +737,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
     def total_loss(self, batch, grad_params, rng=None, step=0):
         info = {}
         rng = rng if rng is not None else self.rng
-        rng, vae_rng, value_rng, q_rng, q_short_rng, actor_rng, z_proposal_rng = (
+        rng, vae_rng, value_rng, q_rng, q_action_rng, actor_rng, z_proposal_rng = (
             jax.random.split(rng, 7)
         )
 
@@ -769,9 +778,9 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             for k, v in z_proposal_info.items():
                 info[f'z_proposal/{k}'] = v
 
-        q_short_loss, q_short_info = self.q_short_loss(batch, grad_params, rng=q_short_rng)
-        for k, v in q_short_info.items():
-            info[f'q_short/{k}'] = v
+        q_action_loss, q_action_info = self.q_action_loss(batch, grad_params, rng=q_action_rng)
+        for k, v in q_action_info.items():
+            info[f'q_action/{k}'] = v
 
         actor_loss, actor_info = self.actor_loss(batch, grad_params, rng=actor_rng)
         for k, v in actor_info.items():
@@ -782,7 +791,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             + value_loss
             + q_loss
             + self.config['z_proposal_coef'] * z_proposal_loss
-            + q_short_loss
+            + q_action_loss
             + actor_loss
         )
         return loss, info
@@ -844,14 +853,14 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
                 n_actions = n_actions + vels / pe_info['flow_steps']
             n_actions = jnp.clip(n_actions, -1, 1)
 
-            q_short = self.network.select('q_short')(
+            q_action = self.network.select('q_action')(
                 n_z_s, goals=n_goals, actions=n_actions,
             )
 
             if len(z_s.shape) == 2:
-                actions = n_actions[jnp.argmax(q_short, axis=0), jnp.arange(z_s.shape[0])]
+                actions = n_actions[jnp.argmax(q_action, axis=0), jnp.arange(z_s.shape[0])]
             else:
-                actions = n_actions[jnp.argmax(q_short)]
+                actions = n_actions[jnp.argmax(q_action)]
 
             return actions
 
@@ -916,11 +925,17 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             z_dim=config['z_dim'],
             layer_norm=config['layer_norm'],
         )
-        vae_decoder_def = VAEDecoder(
-            hidden_dims=decoder_hidden_dims,
-            obs_dim=obs_dim,
-            layer_norm=config['layer_norm'],
-        )
+        if encoder_def is not None and len(raw_observation_shape) == 3:
+            vae_decoder_def = ImpalaDecoder(
+                output_channels=raw_observation_shape[-1],
+                mlp_hidden_dims=decoder_hidden_dims,
+            )
+        else:
+            vae_decoder_def = VAEDecoder(
+                hidden_dims=decoder_hidden_dims,
+                obs_dim=obs_dim,
+                layer_norm=config['layer_norm'],
+            )
 
         # Value and Q networks operate on latent inputs.
         value_def = GCValue(
@@ -934,7 +949,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             num_ensembles=2,
         )
         # Q_short: latent obs, encoded/raw goal, raw action.
-        q_short_def = GCValue(
+        q_action_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             num_ensembles=1,
@@ -982,7 +997,7 @@ class VaeTRLAgent(flax.struct.PyTreeNode):
             target_value=(copy.deepcopy(value_def), (ex_z, ex_z)),
             q=(q_def, (ex_z, ex_z, ex_z)),
             target_q=(copy.deepcopy(q_def), (ex_z, ex_z, ex_z)),
-            q_short=(q_short_def, (ex_z, ex_encoded_goals, ex_actions)),
+            q_action=(q_action_def, (ex_z, ex_encoded_goals, ex_actions)),
             z_proposal=(z_proposal_def, (ex_z, ex_z, ex_z, ex_z_times)),
             actor=(actor_def, ex_actor_in),
         )
@@ -1043,8 +1058,8 @@ def get_config():
             local_value_smoothness_coef=0.0,
             local_value_smoothness_threshold=0.01,
             local_value_smoothness_only_cf=True,
-            q_short_stopgrad_encoder=False,
-            q_short_n_step=1,
+            q_action_stopgrad_encoder=False,
+            q_action_n_step=1,
             pe_type='frs',
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
             rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),

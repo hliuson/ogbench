@@ -7,13 +7,13 @@ import jax.numpy as jnp
 import ml_collections
 import optax
 
-from agents.qshort_pe import QShortPolicyExtractionMixin
+from agents.qaction_pe import QActionPolicyExtractionMixin
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.networks import ActorVectorField, GCActor, GCValue
 
 
-class NStepGCIQLAgent(flax.struct.PyTreeNode, QShortPolicyExtractionMixin):
-    """GCIQL with n-step critic targets and shared q_short policy extraction."""
+class NStepGCIQLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
+    """GCIQL with n-step critic targets and shared q_action policy extraction."""
 
     rng: Any
     network: Any
@@ -113,16 +113,16 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QShortPolicyExtractionMixin):
         for k, v in critic_info.items():
             info[f'critic/{k}'] = v
 
-        q_short_loss, q_short_info = self.q_short_loss(batch, grad_params)
-        for k, v in q_short_info.items():
-            info[f'q_short/{k}'] = v
+        q_action_loss, q_action_info = self.q_action_loss(batch, grad_params)
+        for k, v in q_action_info.items():
+            info[f'q_action/{k}'] = v
 
         rng, actor_rng = jax.random.split(rng)
         actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
         for k, v in actor_info.items():
             info[f'actor/{k}'] = v
 
-        loss = value_loss + critic_loss + q_short_loss + actor_loss
+        loss = value_loss + critic_loss + q_action_loss + actor_loss
         return loss, info
 
     @jax.jit
@@ -160,7 +160,7 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QShortPolicyExtractionMixin):
             layer_norm=config['layer_norm'],
             num_ensembles=2,
         )
-        q_short_def = GCValue(
+        q_action_def = GCValue(
             hidden_dims=config['value_hidden_dims'],
             layer_norm=config['layer_norm'],
             ensemble=False,
@@ -190,7 +190,7 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QShortPolicyExtractionMixin):
             target_value=(copy.deepcopy(value_def), (ex_observations, ex_value_goals)),
             critic=(critic_def, (ex_observations, ex_value_goals, ex_actions)),
             target_critic=(copy.deepcopy(critic_def), (ex_observations, ex_value_goals, ex_actions)),
-            q_short=(q_short_def, (ex_observations, ex_actor_goals, ex_actions)),
+            q_action=(q_action_def, (ex_observations, ex_actor_goals, ex_actions)),
             actor=(actor_def, ex_actor_in),
         )
         networks = {k: v[0] for k, v in network_info.items()}
@@ -230,7 +230,7 @@ def get_config():
             dataset_class='GCDataset',
             need_value_intraj_mask=True,
             need_actor_nstep=True,
-            q_short_n_step=25,
+            q_action_n_step=25,
             value_p_curgoal=0.0,
             value_p_trajgoal=0.8,
             value_p_randomgoal=0.2,

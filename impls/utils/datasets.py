@@ -294,7 +294,7 @@ class GCDataset:
                 self.config.get('agent_name') in midpoint_agent_names
                 or self.config.get('need_actor_nstep', False)
             )
-            and self.config.get('q_short_n_step', 1) > 1
+            and self.config.get('q_action_n_step', 1) > 1
         )
         if actor_need_intraj_mask:
             actor_goal_idxs, actor_is_intraj = self.sample_goals(
@@ -375,7 +375,7 @@ class GCDataset:
             else:
                 batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
             if actor_need_intraj_mask:
-                actor_n_step = int(self.config.get('q_short_n_step', 1))
+                actor_n_step = int(self.config.get('q_action_n_step', 1))
                 actor_nstep_idxs = np.minimum(idxs + actor_n_step, final_state_idxs)
                 batch['actor_goals_is_intraj'] = actor_is_intraj.astype(np.float32)
                 batch['actor_goal_offsets'] = (actor_goal_idxs - idxs) * actor_is_intraj

@@ -89,7 +89,7 @@ submit_trl() {
     --agent.value_p_randomgoal=0.2 \
     --agent.actor_p_trajgoal=0.5 \
     --agent.actor_p_randomgoal=0.5 \
-    --agent.q_short_n_step=25
+    --agent.q_action_n_step=25
 }
 
 submit_mc() {
@@ -104,7 +104,7 @@ submit_mc() {
     --agent.value_p_randomgoal=0.2 \
     --agent.actor_p_trajgoal=0.5 \
     --agent.actor_p_randomgoal=0.5 \
-    --agent.q_short_n_step=25
+    --agent.q_action_n_step=25
 }
 
 submit_gciql() {
@@ -122,7 +122,7 @@ submit_gciql() {
     --agent.value_p_randomgoal=0.2 \
     --agent.actor_p_trajgoal=0.5 \
     --agent.actor_p_randomgoal=0.5 \
-    --agent.q_short_n_step=25
+    --agent.q_action_n_step=25
 }
 
 submit_latent_trl() {
@@ -151,7 +151,7 @@ submit_latent_trl() {
     --agent.actor_p_randomgoal=0.5 \
     --agent.sigreg_coef=0.001 \
     --agent.cf_expectile=0.7 \
-    --agent.q_short_n_step=25 \
+    --agent.q_action_n_step=25 \
     --agent.z_proposal_awr_beta=1.0 \
     --agent.z_proposal_awr_max_weight=20.0 \
     --agent.z_proposal_awr_num_random_support=1 \
