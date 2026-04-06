@@ -19,10 +19,12 @@ impls/slurm
 impls/slurm-*.out
 impls/results/
 impls/scripts/
+impls/viz_**
 nohup.out
 **.out
 
 # Claude Code
+/agents/
 .claude/
 CLAUDE.md
 EXPERIMENTS.md

@@ -362,7 +362,7 @@ class LatentSHARSAAgent(flax.struct.PyTreeNode):
         if config.get('discrete', False):
             raise ValueError(
                 'Minimal latent_sharsa supports only continuous action spaces; '
-                'use discrete_latent_sharsa for discrete actions.'
+                'discrete actions are no longer supported in latent_sharsa.'
             )
 
         rng = jax.random.PRNGKey(seed)

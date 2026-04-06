@@ -209,7 +209,6 @@ class GCDataset:
         if self.config.get('agent_name') in (
             'trl',
             'latent_trl',
-            'discrete_latent_trl',
             'ltrl_sharsa',
             'ltrl_hiql',
             'state_trl',
@@ -255,18 +254,22 @@ class GCDataset:
         midpoint_agent_names = (
             'trl',
             'latent_trl',
-            'discrete_latent_trl',
             'ltrl_sharsa',
             'ltrl_hiql',
             'state_trl',
             'vae_trl',
         )
         need_intraj_mask = (
-            self.config.get('agent_name') in midpoint_agent_names
-            and self.config['value_p_randomgoal'] > 0
+            self.config['value_p_randomgoal'] > 0
             and (
-                self.config.get('z_proposal_coef', 0) > 0
-                or self.config.get('use_dual_value_goals', False)
+                (
+                    self.config.get('agent_name') in midpoint_agent_names
+                    and (
+                        self.config.get('z_proposal_coef', 0) > 0
+                        or self.config.get('use_dual_value_goals', False)
+                    )
+                )
+                or self.config.get('need_value_intraj_mask', False)
             )
         )
         if need_intraj_mask:
@@ -287,7 +290,10 @@ class GCDataset:
                 self.config['value_geom_sample'],
             )
         actor_need_intraj_mask = (
-            self.config.get('agent_name') in midpoint_agent_names
+            (
+                self.config.get('agent_name') in midpoint_agent_names
+                or self.config.get('need_actor_nstep', False)
+            )
             and self.config.get('q_short_n_step', 1) > 1
         )
         if actor_need_intraj_mask:
@@ -375,6 +381,11 @@ class GCDataset:
                 batch['actor_goal_offsets'] = (actor_goal_idxs - idxs) * actor_is_intraj
                 batch['actor_nstep_observations'] = self.get_observations(actor_nstep_idxs)
                 batch['actor_nstep_steps'] = actor_nstep_idxs - idxs
+            if self.config.get('critic_n_step', 1) > 1:
+                value_n_step = int(self.config.get('critic_n_step', 1))
+                value_nstep_idxs = np.minimum(idxs + value_n_step, final_state_idxs)
+                batch['value_nstep_observations'] = self.get_observations(value_nstep_idxs)
+                batch['value_nstep_steps'] = value_nstep_idxs - idxs
             if self.config.get('use_dual_value_goals', False):
                 batch['value_goal_observations_intraj'] = self.get_observations(value_goal_idxs_intraj)
                 batch['value_goal_observations_random'] = self.get_observations(value_goal_idxs_random)
