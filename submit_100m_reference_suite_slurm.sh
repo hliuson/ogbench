@@ -1,8 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-# Submit the 100M reference suite as separate SLURM jobs.
-# This writes one small job script per run into JOB_SCRIPT_DIR and submits each with sbatch.
+# Generate the 100M reference suite as separate SLURM jobs.
+# By default this only writes one small job script per run into JOB_SCRIPT_DIR.
+# Set SUBMIT=1 to also call sbatch on each generated script.
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMPLS_DIR="${ROOT_DIR}/impls"
@@ -11,6 +12,7 @@ SAVE_DIR="${SAVE_DIR:-/scratch/engin_root/engin1/hliuson/ogbench_exp}"
 PYTHON_RUNNER="${PYTHON_RUNNER:-uv run python}"
 JOB_SCRIPT_DIR="${JOB_SCRIPT_DIR:-${ROOT_DIR}/generated_slurm_jobs}"
 LOG_DIR="${LOG_DIR:-${ROOT_DIR}/impls/slurm_logs}"
+SUBMIT="${SUBMIT:-0}"
 SEEDS=(0 1 2)
 
 mkdir -p "${JOB_SCRIPT_DIR}" "${LOG_DIR}"
@@ -73,7 +75,10 @@ $*
 JOB
 
   chmod +x "${script_path}"
-  sbatch "${script_path}"
+  echo "wrote ${script_path}"
+  if [ "${SUBMIT}" = "1" ]; then
+    sbatch "${script_path}"
+  fi
 }
 
 submit_trl() {
