@@ -45,6 +45,8 @@ submit_job() {
 set -euo pipefail
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
+export WANDB_ENTITY=latent-trl
+export WANDB_PROJECT=OGBench
 module load uv
 export UV_CACHE_DIR=/scratch/engin_root/engin1/hliuson/.cache/uv
 mkdir -p "\${UV_CACHE_DIR}"
