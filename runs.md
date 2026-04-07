@@ -3,9 +3,7 @@
 Preliminary sweep: 
 
 ```bash
-cd /home/hliuson/research/ogbench
-module load uv
-uv run python submit_100m_reference_suite_slurm.py \
+python submit_100m_reference_suite_slurm.py \
   --task puzzle-4x6 \
   --task cube-triple \
   --task humanoidmaze-giant-navigate \
