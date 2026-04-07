@@ -7,6 +7,9 @@ import jax.numpy as jnp
 class QActionPolicyExtractionMixin:
     """Shared q_action + actor policy extraction used by lightweight baselines."""
 
+    def _q_action_target_is_bounded(self):
+        return bool(self.config.get('q_action_target_is_bounded', True))
+
     @staticmethod
     def _get_pe_info_from_config(config):
         if config['pe_type'] == 'discrete':
@@ -24,6 +27,7 @@ class QActionPolicyExtractionMixin:
 
     def q_action_loss(self, batch, grad_params):
         """Distill q_action(s, a, g) from an n-step bootstrap into target value."""
+        target_is_bounded = self._q_action_target_is_bounded()
         q_action_n_step = int(self.config.get('q_action_n_step', 1))
         next_obs_key = (
             'actor_nstep_observations'
@@ -34,7 +38,8 @@ class QActionPolicyExtractionMixin:
         actor_goals = batch['actor_goals']
 
         v_next = self.network.select('target_value')(next_observations, goals=actor_goals)
-        v_next = jax.nn.sigmoid(v_next)
+        if target_is_bounded:
+            v_next = jax.nn.sigmoid(v_next)
         if v_next.ndim > 1:
             v_next = jnp.minimum(v_next[0], v_next[1])
 
@@ -60,15 +65,19 @@ class QActionPolicyExtractionMixin:
             actions=batch['actions'],
             params=grad_params,
         )
-        q_action = jax.nn.sigmoid(q_action_logits)
-        q_action_loss = self.bce_loss(q_action_logits, jax.lax.stop_gradient(target)).mean()
+        if target_is_bounded:
+            q_action = jax.nn.sigmoid(q_action_logits)
+            q_action_loss = self.bce_loss(q_action_logits, jax.lax.stop_gradient(target)).mean()
+        else:
+            q_action = q_action_logits
+            q_action_loss = ((q_action_logits - jax.lax.stop_gradient(target)) ** 2).mean()
 
         return q_action_loss, {
             'q_action_loss': q_action_loss,
             'q_action_mean': q_action.mean(),
             'q_action_max': q_action.max(),
             'q_action_min': q_action.min(),
-            'v_next_target_mean': target.mean(),
+            'q_action_target_mean': target.mean(),
             'n_step': jnp.asarray(q_action_n_step, dtype=jnp.float32),
             'exact_reached_frac': exact_reached.mean(),
         }

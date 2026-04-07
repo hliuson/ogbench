@@ -209,6 +209,7 @@ class GCDataset:
         if self.config.get('agent_name') in (
             'trl',
             'latent_trl',
+            'latent_trl_state_decoder',
             'ltrl_sharsa',
             'ltrl_hiql',
             'state_trl',
@@ -254,6 +255,7 @@ class GCDataset:
         midpoint_agent_names = (
             'trl',
             'latent_trl',
+            'latent_trl_state_decoder',
             'ltrl_sharsa',
             'ltrl_hiql',
             'state_trl',

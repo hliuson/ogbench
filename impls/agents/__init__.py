@@ -11,6 +11,7 @@ from agents.sharsa import SHARSAAgent
 from agents.state_trl import StateTRLAgent
 from agents.trl import TRLAgent
 from agents.latent_trl import LatentTRLAgent
+from agents.latent_trl_state_decoder import LatentTRLStateDecoderAgent
 from agents.latent_sharsa import LatentSHARSAAgent
 from agents.vae_trl import VaeTRLAgent
 
@@ -28,6 +29,7 @@ agents = dict(
     state_trl=StateTRLAgent,
     trl=TRLAgent,
     latent_trl=LatentTRLAgent,
+    latent_trl_state_decoder=LatentTRLStateDecoderAgent,
     latent_sharsa=LatentSHARSAAgent,
     vae_trl=VaeTRLAgent,
 )

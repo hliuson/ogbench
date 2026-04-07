@@ -204,6 +204,7 @@ def get_config():
             dataset_class='GCDataset',
             need_value_intraj_mask=True,
             need_actor_nstep=True,
+            q_action_target_is_bounded=True,
             q_action_n_step=25,
             value_p_curgoal=0.0,
             value_p_trajgoal=0.8,

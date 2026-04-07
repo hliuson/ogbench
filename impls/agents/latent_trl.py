@@ -837,7 +837,7 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
         rng, awr_rng = jax.random.split(rng)
         awr_beta = self.config.get('z_proposal_awr_beta', 0.0)
         awr_num_random_support = max(1, int(self.config.get('z_proposal_awr_num_random_support', 1)))
-        awr_value_eps = self.config.get('z_proposal_awr_value_eps', 0.0)
+        awr_value_eps = self.config.get('z_proposal_awr_value_eps', 0.001)
         intraj_mask = batch.get('value_goals_is_intraj', None)
         proposal_mask = intraj_mask
         awr_base_v = None
@@ -891,9 +891,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             awr_max_weight = self.config.get('z_proposal_awr_max_weight', 20.0)
             if awr_max_weight is not None and awr_max_weight > 0:
                 awr_weight_matrix = jnp.minimum(awr_weight_matrix, awr_max_weight)
-            if self.config.get('z_proposal_awr_subtract_one', False):
-                awr_weight_matrix = jnp.maximum(awr_weight_matrix - 1.0, 0.0)
-
             z_target = z_candidates.reshape(-1, z_candidates.shape[-1])
             flow_observations = obs_bc.reshape(-1, obs_dim)
             flow_goals = goals_bc.reshape(-1, goal_dim)
@@ -961,10 +958,6 @@ class LatentTRLAgent(flax.struct.PyTreeNode):
             awr_max_weight = self.config.get('z_proposal_awr_max_weight', 20.0)
             if awr_max_weight is not None and awr_max_weight > 0:
                 info['awr_weight_cap_frac'] = (awr_weight >= (awr_max_weight - 1e-6)).mean()
-            info['awr_weight_subtract_one'] = jnp.asarray(
-                float(self.config.get('z_proposal_awr_subtract_one', False)),
-                dtype=z_target.dtype,
-            )
             info['awr_random_support'] = jnp.asarray(1.0, dtype=z_target.dtype)
             info['awr_num_random_support'] = jnp.asarray(float(awr_num_random_support), dtype=z_target.dtype)
             info['awr_intraj_support'] = jnp.asarray(float(intraj_mask is not None), dtype=z_target.dtype)
@@ -1533,9 +1526,8 @@ def get_config():
             z_proposal_awr_beta=0.0,
             z_proposal_awr_max_weight=20.0,
             z_proposal_awr_num_random_support=4,
-            z_proposal_awr_value_eps=0.01,
+            z_proposal_awr_value_eps=0.001,
             z_proposal_awr_intraj_prob=-1.0,
-            z_proposal_awr_subtract_one=False,
             cf_num_z_proposals=1,
             pe_type='frs',  # frs, rpg, discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),

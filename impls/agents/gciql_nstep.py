@@ -25,17 +25,18 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
         return weight * (diff**2)
 
     def value_loss(self, batch, grad_params):
-        q1, q2 = self.network.select('target_critic')(
+        q1_logits, q2_logits = self.network.select('target_critic')(
             batch['observations'],
             batch['value_goals'],
             batch['actions'],
         )
-        q = jnp.minimum(q1, q2)
-        v = self.network.select('value')(
+        q = jax.nn.sigmoid(jnp.minimum(q1_logits, q2_logits))
+        v_logits = self.network.select('value')(
             batch['observations'],
             batch['value_goals'],
             params=grad_params,
         )
+        v = jax.nn.sigmoid(v_logits)
 
         if 'value_goals_is_intraj' in batch:
             tau = jnp.where(
@@ -45,7 +46,8 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
             )
         else:
             tau = self.config['expectile']
-        value_loss = self.expectile_loss(q - v, q - v, tau).mean()
+        expectile_weight = jnp.where(q >= v, tau, (1 - tau))
+        value_loss = (expectile_weight * self.bce_loss(v_logits, jax.lax.stop_gradient(q))).mean()
 
         return value_loss, {
             'value_loss': value_loss,
@@ -64,6 +66,7 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
         )
         next_observations = batch[next_obs_key]
         next_v = self.network.select('target_value')(next_observations, batch['value_goals'])
+        next_v = jax.nn.sigmoid(next_v)
         if next_v.ndim > 1:
             next_v = jnp.minimum(next_v[0], next_v[1])
 
@@ -83,13 +86,16 @@ class NStepGCIQLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
             exact_reached = jnp.zeros_like(bootstrap_target)
             q_target = batch['rewards'] + self.config['discount'] * batch['masks'] * next_v
 
-        q1, q2 = self.network.select('critic')(
+        q1_logits, q2_logits = self.network.select('critic')(
             batch['observations'],
             batch['value_goals'],
             batch['actions'],
             params=grad_params,
         )
-        critic_loss = ((q1 - q_target) ** 2 + (q2 - q_target) ** 2).mean()
+        critic_loss = (
+            self.bce_loss(q1_logits, jax.lax.stop_gradient(q_target))
+            + self.bce_loss(q2_logits, jax.lax.stop_gradient(q_target))
+        ).mean()
 
         return critic_loss, {
             'critic_loss': critic_loss,
@@ -230,6 +236,7 @@ def get_config():
             dataset_class='GCDataset',
             need_value_intraj_mask=True,
             need_actor_nstep=True,
+            q_action_target_is_bounded=True,
             q_action_n_step=25,
             value_p_curgoal=0.0,
             value_p_trajgoal=0.8,
