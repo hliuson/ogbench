@@ -99,6 +99,15 @@ TASKS: Mapping[str, TaskSpec] = {
         job_suffix='ct-100m',
         run_group_suffix='ct',
     ),
+    'cube-quadruple': TaskSpec(
+        key='cube-quadruple',
+        aliases=('cube-quadruple', 'cq'),
+        env_name='cube-quadruple-play-oraclerep-v0',
+        dataset_name='cube-quadruple-play-100m-v0',
+        dataset_replace_interval=1000,
+        job_suffix='cq-100m',
+        run_group_suffix='cq',
+    ),
     'humanoidmaze-giant-navigate': TaskSpec(
         key='humanoidmaze-giant-navigate',
         aliases=('hm-giant-nav', 'hmg-nav'),
