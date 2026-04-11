@@ -71,7 +71,13 @@ def setup_wandb(
     if env_mode is not None:
         mode = env_mode
     wandb_output_dir = tempfile.mkdtemp()
-    tags = [group] if group is not None else None
+    tags = []
+    env_tags = os.environ.get('WANDB_TAGS')
+    if env_tags:
+        tags.extend(tag.strip() for tag in env_tags.split(',') if tag.strip())
+    if group is not None:
+        tags.append(group)
+    tags = list(dict.fromkeys(tags)) or None
 
     init_kwargs = dict(
         config=get_flag_dict(),

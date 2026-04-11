@@ -373,6 +373,7 @@ def render_job_script(
     uv_cache_dir: Path,
     command_args: Sequence[str],
     wandb_name: str,
+    wandb_tags: Sequence[str],
 ) -> str:
     base_url = f'https://rail.eecs.berkeley.edu/datasets/ogbench/{dataset_name}'
     command_block = format_command_lines([*python_runner, 'main.py', *command_args])
@@ -393,6 +394,7 @@ export PYOPENGL_PLATFORM=egl
 export WANDB_ENTITY=latent-trl
 export WANDB_PROJECT=OGBench
 export WANDB_NAME={shlex.quote(wandb_name)}
+export WANDB_TAGS={shlex.quote(','.join(wandb_tags))}
 module load uv
 export UV_CACHE_DIR={shlex.quote(str(uv_cache_dir))}
 mkdir -p "$UV_CACHE_DIR"
@@ -574,6 +576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         uv_cache_dir=uv_cache_dir,
                         command_args=[f'--{key}={value}' for key, value in command_args.items()],
                         wandb_name=wandb_name,
+                        wandb_tags=args.tag,
                     )
 
                     script_path = job_script_dir / f'{job_name}.sh'

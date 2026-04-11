@@ -85,7 +85,11 @@ def _resolve_preprocess_frame_stack(*datasets):
 def main(_):
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
-    setup_wandb(project='OGBench', group=FLAGS.run_group, name=exp_name)
+    setup_wandb(
+        project='OGBench',
+        group=FLAGS.run_group,
+        name=os.environ.get('WANDB_NAME', exp_name),
+    )
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     os.makedirs(FLAGS.save_dir, exist_ok=True)
