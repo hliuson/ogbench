@@ -17,8 +17,8 @@ def load_agent(exp_dir, epoch, env):
         flag_dict = json.load(f)
     config = ConfigDict(flag_dict['agent'])
     agent_name = config['agent_name']
-    if agent_name == 'latent_trl':
-        from agents.latent_trl import LatentTRLAgent as AgentClass
+    if agent_name == 'cf_trl':
+        from agents.cf_trl import CFTRLAgent as AgentClass
     elif agent_name == 'trl':
         from agents.trl import TRLAgent as AgentClass
     else:
@@ -62,7 +62,7 @@ def main():
     def get_value(agent, s, g):
         """Get V(s, g) or Q(s, pi(s,g), g) depending on agent type."""
         agent_name = agent.config['agent_name']
-        if agent_name == 'latent_trl':
+        if agent_name == 'cf_trl':
             v_logits = agent.network.select('value')(s, goals=g)
             vs = jax.nn.sigmoid(v_logits)
             return float(jnp.minimum(vs[0], vs[1]).squeeze())

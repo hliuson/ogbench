@@ -207,13 +207,11 @@ class GCDataset:
             )
 
         if self.config.get('agent_name') in (
+            'cf_trl',
             'trl',
-            'latent_trl',
-            'latent_trl_state_decoder',
+            'trl_original',
             'ltrl_sharsa',
             'ltrl_hiql',
-            'state_trl',
-            'vae_trl',
         ):
             cur_idx = 0
             valid_idxs = []
@@ -253,13 +251,11 @@ class GCDataset:
             batch['next_observations'] = self.get_observations(idxs + 1)
 
         midpoint_agent_names = (
+            'cf_trl',
             'trl',
-            'latent_trl',
-            'latent_trl_state_decoder',
+            'trl_original',
             'ltrl_sharsa',
             'ltrl_hiql',
-            'state_trl',
-            'vae_trl',
         )
         need_intraj_mask = (
             self.config['value_p_randomgoal'] > 0
@@ -372,7 +368,7 @@ class GCDataset:
                     value_midpoint_idxs = np.random.randint(idxs, mixed_midpoint_goal_idxs)
 
             batch['value_goal_observations'] = self.get_observations(value_goal_idxs)
-            if self.config.get('agent_name') in {'ltrl_hiql', 'latent_trl', 'vae_trl'}:
+            if self.config.get('agent_name') in {'cf_trl', 'ltrl_hiql'}:
                 batch['actor_goal_observations'] = self.get_observations(actor_goal_idxs)
             else:
                 batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)

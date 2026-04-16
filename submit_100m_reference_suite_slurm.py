@@ -6,9 +6,9 @@ Examples:
     uv run python submit_100m_reference_suite_slurm.py --submit
     uv run python submit_100m_reference_suite_slurm.py \
         --task puzzle \
-        --method latent \
+        --method cf-trl \
         --seed 0 \
-        --sweep agent.z_dim=16,32,64 \
+        --sweep agent.z_proposal_awr_beta=1.0,3.0 \
         --sweep agent.cf_expectile=0.7,0.9 \
         --tag z-sweep
 """
@@ -140,6 +140,25 @@ METHODS: Mapping[str, MethodSpec] = {
             ('agent.q_action_n_step', '25'),
         ),
     ),
+    'trl_original': MethodSpec(
+        key='trl_original',
+        aliases=('trl-original', 'trlo', 'trlorig'),
+        agent_path='agents/trl_original.py',
+        job_prefix='trlo',
+        wandb_name='trl-original',
+        base_args=(
+            ('agent.batch_size', '1024'),
+            ('agent.discount', '0.999'),
+            ('agent.expectile', '0.7'),
+            ('agent.value_hidden_dims', '(1024, 1024, 1024, 1024)'),
+            ('agent.actor_hidden_dims', '(1024, 1024, 1024, 1024)'),
+            ('agent.value_p_curgoal', '0.0'),
+            ('agent.value_p_trajgoal', '1.0'),
+            ('agent.value_p_randomgoal', '0.0'),
+            ('agent.actor_p_trajgoal', '0.5'),
+            ('agent.actor_p_randomgoal', '0.5'),
+        ),
+    ),
     'mc': MethodSpec(
         key='mc',
         aliases=(),
@@ -181,27 +200,18 @@ METHODS: Mapping[str, MethodSpec] = {
             ('agent.q_action_n_step', '25'),
         ),
     ),
-    'latent_trl': MethodSpec(
-        key='latent_trl',
-        aliases=('latent', 'latent-trl', 'ltrl'),
-        agent_path='agents/latent_trl.py',
-        job_prefix='ltrl',
-        wandb_name='latent-trl',
+    'cf_trl': MethodSpec(
+        key='cf_trl',
+        aliases=('cf', 'cf-trl', 'cftrl', 'latent', 'latent-trl', 'ltrl'),
+        agent_path='agents/cf_trl.py',
+        job_prefix='cftrl',
+        wandb_name='cf-trl',
         base_args=(
             ('agent.batch_size', '1024'),
             ('agent.discount', '0.999'),
             ('agent.expectile', '0.7'),
             ('agent.value_hidden_dims', '(1024, 1024, 1024, 1024)'),
             ('agent.actor_hidden_dims', '(1024, 1024, 1024, 1024)'),
-            ('agent.z_dim', '32'),
-            ('agent.state_z_dim', '32'),
-            ('agent.vae_encoder_hidden_dims', '(256, 256, 256, 256)'),
-            ('agent.vae_decoder_hidden_dims', '(256, 256)'),
-            ('agent.reg_coef', '1.0'),
-            ('agent.vae_recon_coef', '0.25'),
-            ('agent.vae_beta', '0.01'),
-            ('agent.midpoint_decoder_coef', '1.0'),
-            ('agent.direct_intraj_value_max_offset', '32'),
             ('agent.z_proposal_coef', '1.0'),
             ('agent.cf_num_z_proposals', '1'),
             ('agent.value_p_curgoal', '0.0'),
@@ -209,14 +219,10 @@ METHODS: Mapping[str, MethodSpec] = {
             ('agent.value_p_randomgoal', '0.2'),
             ('agent.actor_p_trajgoal', '0.5'),
             ('agent.actor_p_randomgoal', '0.5'),
-            ('agent.sigreg_coef', '0.001'),
             ('agent.cf_expectile', '0.7'),
             ('agent.q_action_n_step', '25'),
             ('agent.z_proposal_awr_beta', '1.0'),
             ('agent.z_proposal_awr_max_weight', '20.0'),
-            ('agent.z_proposal_awr_num_random_support', '1'),
-            ('agent.z_proposal_awr_value_eps', '0.001'),
-            ('agent.z_proposal_awr_intraj_prob', '0.5'),
         ),
     ),
 }
