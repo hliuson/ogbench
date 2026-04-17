@@ -258,17 +258,14 @@ class GCDataset:
             'ltrl_hiql',
         )
         need_intraj_mask = (
-            self.config['value_p_randomgoal'] > 0
-            and (
-                (
-                    self.config.get('agent_name') in midpoint_agent_names
-                    and (
-                        self.config.get('z_proposal_coef', 0) > 0
-                        or self.config.get('use_dual_value_goals', False)
-                    )
+            (
+                self.config.get('agent_name') in midpoint_agent_names
+                and (
+                    self.config.get('z_proposal_coef', 0) > 0
+                    or self.config.get('use_dual_value_goals', False)
                 )
-                or self.config.get('need_value_intraj_mask', False)
             )
+            or self.config.get('need_value_intraj_mask', False)
         )
         if need_intraj_mask:
             value_goal_idxs, value_is_intraj = self.sample_goals(
@@ -390,6 +387,14 @@ class GCDataset:
                 batch['value_goal_observations_cf'] = batch['value_goal_observations_random']
                 batch['value_offsets_intraj'] = value_goal_idxs_intraj - idxs
                 batch['value_midpoint_offsets_intraj'] = value_midpoint_idxs_intraj - idxs
+            random_support_k = int(self.config.get('z_proposal_random_goal_num_support', 0))
+            if self.config.get('agent_name') == 'cf_trl' and random_support_k > 0:
+                random_support_idxs = self.dataset.get_random_idxs(len(idxs) * random_support_k)
+                random_support_observations = self.get_observations(random_support_idxs)
+                batch['value_random_support_observations'] = jax.tree_util.tree_map(
+                    lambda arr: arr.reshape(len(idxs), random_support_k, *arr.shape[1:]),
+                    random_support_observations,
+                )
             if need_intraj_mask:
                 # Only compute offsets for intraj; cf offsets are meaningless
                 # (cross-trajectory) and would produce inf via discount^negative.
