@@ -14,7 +14,7 @@ from utils.networks import ActorVectorField, GCActor, GCDiscreteActor, GCValue
 
 
 class CFTRLAgent(flax.struct.PyTreeNode):
-    """CF-TRL with intraj or flow-Q proposer objectives."""
+    """CF-TRL with AWR or flow-Q proposer objectives."""
 
     rng: Any
     network: Any
@@ -53,8 +53,12 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             'z_proposal_random_goal_num_support must be non-negative',
         )
         _require(
-            config.get('z_proposal_learning_method', 'intraj') in {'intraj', 'flow_q'},
-            "z_proposal_learning_method must be one of 'intraj' or 'flow_q'",
+            config.get('z_proposal_learning_method', 'awr') in {'awr', 'flow_q', 'intraj'},
+            "z_proposal_learning_method must be one of 'awr', 'flow_q', or legacy alias 'intraj'",
+        )
+        _require(
+            float(config.get('z_proposal_flow_alpha', 1.0)) >= 0.0,
+            f'z_proposal_flow_alpha must be non-negative, got {config.get("z_proposal_flow_alpha", 1.0)}',
         )
         _require(config.get('use_dual_value_goals', True), 'cf_trl requires use_dual_value_goals=True')
         _require(
@@ -150,7 +154,10 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         return max(1, int(self.config.get('cf_num_z_proposals', 1)))
 
     def _get_z_proposal_learning_method(self):
-        return self.config.get('z_proposal_learning_method', 'intraj')
+        method = self.config.get('z_proposal_learning_method', 'awr')
+        if method == 'intraj':
+            return 'awr'
+        return method
 
     def _use_mixed_goals_for_proposal(self):
         return bool(self.config.get('z_proposal_use_mixed_goals', False))
@@ -320,7 +327,7 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         """Select proposer-training triples for the configured learning rule."""
         del step, rng
         method = self._get_z_proposal_learning_method()
-        if method not in {'intraj', 'flow_q'}:
+        if method not in {'awr', 'flow_q'}:
             raise ValueError(f'Unsupported z_proposal_learning_method: {method}')
 
         if 'value_goals_is_intraj' not in batch:
@@ -328,7 +335,7 @@ class CFTRLAgent(flax.struct.PyTreeNode):
 
         if self._use_mixed_goals_for_proposal():
             return dict(batch)
-        if method == 'intraj' and int(self.config.get('z_proposal_random_goal_num_support', 0)) > 0:
+        if method == 'awr' and int(self.config.get('z_proposal_random_goal_num_support', 0)) > 0:
             return dict(batch)
         return self._select_intraj_proposal_training_batch(batch)
 
@@ -550,12 +557,10 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         info['target_traj_mean_cf'] = _masked_mean(target_traj, cf_mask)
         return total_loss, info
 
-    def _z_proposal_intraj_loss(self, batch, grad_params, rng, step=0):
+    def _compute_z_proposal_awr_loss(self, awr_batch, grad_params, rng):
         """Train the z-proposal network with support-AWR over candidate midpoints."""
-        rng, awr_rng = jax.random.split(rng)
         awr_beta = self.config.get('z_proposal_awr_beta', 0.0)
         random_support_k = int(self.config.get('z_proposal_random_goal_num_support', 0))
-        awr_batch = self._select_proposal_training_batch(batch, step, awr_rng)
         intraj_mask = awr_batch.get('value_goals_is_intraj', None)
         flow_observations = self._encode_visual(awr_batch['observations'])
         flow_goals = self._encode_visual(awr_batch['value_goal_observations'])
@@ -646,6 +651,11 @@ class CFTRLAgent(flax.struct.PyTreeNode):
 
         return loss, info
 
+    def _z_proposal_awr_loss(self, batch, grad_params, rng, step=0):
+        rng, awr_rng = jax.random.split(rng)
+        awr_batch = self._select_proposal_training_batch(batch, step, awr_rng)
+        return self._compute_z_proposal_awr_loss(awr_batch, grad_params, rng)
+
     def _sample_z_proposal_with_module(
         self,
         module_name,
@@ -686,13 +696,14 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         return imf_one_shot_sample(rng, sample_shape, vector_field_fn)
 
     def _z_proposal_flow_q_loss(self, batch, grad_params, rng, step=0):
-        """Train the z-proposal network by maximizing factorized midpoint value."""
+        """Train the z-proposal network with Q-learning plus intraj flow regularization."""
+        q_rng, awr_rng = jax.random.split(rng)
         flow_q_batch = self._select_proposal_training_batch(batch, step, rng=None)
         flow_observations = self._encode_visual(flow_q_batch['observations'])
         flow_goals = self._encode_visual(flow_q_batch['value_goal_observations'])
         z_proposed = self._sample_z_proposal(
             flow_q_batch,
-            rng,
+            q_rng,
             num_samples=1,
             observations=flow_observations,
             goals=flow_goals,
@@ -704,10 +715,17 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         first_v = self._aggregate_q_ensembles(jax.nn.sigmoid(first_v_logits))
         second_v = self._aggregate_q_ensembles(jax.nn.sigmoid(second_v_logits))
         flow_q = first_v * second_v
-        loss = -flow_q.mean()
+        q_loss = -flow_q.mean()
+        flow_alpha = float(self.config.get('z_proposal_flow_alpha', 1.0))
+        awr_batch = self._select_intraj_proposal_training_batch(batch)
+        flow_loss, flow_info = self._compute_z_proposal_awr_loss(awr_batch, grad_params, awr_rng)
+        loss = q_loss + flow_alpha * flow_loss
 
         info = {
             'loss': loss,
+            'q_loss': q_loss,
+            'flow_loss': flow_loss,
+            'flow_alpha': jnp.asarray(flow_alpha, dtype=flow_q.dtype),
             'flow_q_mean': flow_q.mean(),
             'flow_q_max': flow_q.max(),
             'flow_q_min': flow_q.min(),
@@ -724,12 +742,16 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             info['flow_q_mean_intraj'] = self._masked_mean(flow_q, intraj_mask)
             info['flow_q_mean_cf'] = self._masked_mean(flow_q, cf_mask)
 
+        for k, v in flow_info.items():
+            if k != 'loss':
+                info[f'awr_{k}'] = v
+
         return loss, info
 
     def z_proposal_loss(self, batch, grad_params, rng, step=0):
         method = self._get_z_proposal_learning_method()
-        if method == 'intraj':
-            return self._z_proposal_intraj_loss(batch, grad_params, rng, step=step)
+        if method == 'awr':
+            return self._z_proposal_awr_loss(batch, grad_params, rng, step=step)
         if method == 'flow_q':
             return self._z_proposal_flow_q_loss(batch, grad_params, rng, step=step)
         raise ValueError(f'Unsupported z_proposal_learning_method: {method}')
@@ -1157,10 +1179,11 @@ def get_config():
             encoder='',
             freeze_encoder=False,
             z_proposal_coef=1.0,
-            z_proposal_learning_method='intraj',
+            z_proposal_learning_method='awr',
             z_proposal_use_mixed_goals=True,
             z_proposal_awr_beta=1.0,
             z_proposal_awr_max_weight=20.0,
+            z_proposal_flow_alpha=1.0,
             cf_num_z_proposals=1,
             pe_type='frs',  # frs, rpg, discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
