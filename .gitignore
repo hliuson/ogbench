@@ -34,3 +34,4 @@ EXPERIMENTS.md
 impls/analysis/
 EXPERIMENTS.archive.*
 HIERARCHICAL_POLICY_EXTRACTION.md
+generated_slurm_jobs/

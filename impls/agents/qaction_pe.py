@@ -10,6 +10,10 @@ class QActionPolicyExtractionMixin:
     def _q_action_target_is_bounded(self):
         return bool(self.config.get('q_action_target_is_bounded', True))
 
+    def _get_value_bootstrap_goals(self, batch):
+        """Return the goal representation used when bootstrapping through the value function."""
+        return batch['actor_goals']
+
     @staticmethod
     def _get_pe_info_from_config(config):
         if config['pe_type'] == 'discrete':
@@ -36,8 +40,9 @@ class QActionPolicyExtractionMixin:
         )
         next_observations = batch[next_obs_key]
         actor_goals = batch['actor_goals']
+        value_bootstrap_goals = self._get_value_bootstrap_goals(batch)
 
-        v_next = self.network.select('target_value')(next_observations, goals=actor_goals)
+        v_next = self.network.select('target_value')(next_observations, goals=value_bootstrap_goals)
         if target_is_bounded:
             v_next = jax.nn.sigmoid(v_next)
         if v_next.ndim > 1:
@@ -97,9 +102,10 @@ class QActionPolicyExtractionMixin:
             else:
                 q_actions = jnp.clip(dist.sample(seed=rng), -1, 1)
             u_next = batch['next_observations']
+            value_bootstrap_goals = self._get_value_bootstrap_goals(batch)
             v_next = self.network.select('value')(
                 u_next,
-                goals=batch['actor_goals'],
+                goals=value_bootstrap_goals,
             )
             if v_next.ndim > 1:
                 v_next = jnp.minimum(v_next[0], v_next[1])

@@ -1,4 +1,5 @@
 from agents.cf_trl import CFTRLAgent
+from agents.cf_trl_flowq import CFTRLFlowQAgent
 from agents.crl import CRLAgent
 from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
@@ -15,6 +16,7 @@ from agents.trl_original import TRLOriginalAgent
 
 agents = dict(
     cf_trl=CFTRLAgent,
+    cf_trl_flowq=CFTRLFlowQAgent,
     crl=CRLAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,

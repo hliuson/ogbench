@@ -166,11 +166,6 @@ class GCDataset:
     - actor_p_trajgoal: Probability of using a future state in the same trajectory as the actor goal.
     - actor_p_randomgoal: Probability of using a random state as the actor goal.
     - actor_geom_sample: Whether to use geometric sampling for future actor goals.
-    - use_dual_value_goals: Whether to additionally provide an explicit pair of
-      value goals:
-        - one guaranteed in-trajectory goal (`*_intraj`)
-        - one guaranteed random goal (`*_random`)
-      This does not change the main mixed `value_goals` field.
     - gc_negative: Whether to use '0 if s == g else -1' (True) or '1 if s == g else 0' (False) as the reward.
     - p_aug: Probability of applying image augmentation.
     - frame_stack: Number of frames to stack.
@@ -185,6 +180,12 @@ class GCDataset:
     dataset: Dataset
     config: Any
     preprocess_frame_stack: bool = True
+
+    def _use_dual_value_goals(self):
+        return self.config.get('use_dual_value_goals', False) or self.config.get('agent_name') in {
+            'cf_trl',
+            'cf_trl_flowq',
+        }
 
     def __post_init__(self):
         self.size = self.dataset.size
@@ -201,13 +202,14 @@ class GCDataset:
         assert np.isclose(
             self.config['actor_p_curgoal'] + self.config['actor_p_trajgoal'] + self.config['actor_p_randomgoal'], 1.0
         )
-        if self.config.get('use_dual_value_goals', False):
+        if self._use_dual_value_goals():
             assert self.config['value_p_curgoal'] + self.config['value_p_trajgoal'] > 0, (
                 'use_dual_value_goals requires nonzero in-trajectory value-goal mass'
             )
 
         if self.config.get('agent_name') in (
             'cf_trl',
+            'cf_trl_flowq',
             'trl',
             'trl_original',
             'ltrl_sharsa',
@@ -252,6 +254,7 @@ class GCDataset:
 
         midpoint_agent_names = (
             'cf_trl',
+            'cf_trl_flowq',
             'trl',
             'trl_original',
             'ltrl_sharsa',
@@ -262,7 +265,7 @@ class GCDataset:
                 self.config.get('agent_name') in midpoint_agent_names
                 and (
                     self.config.get('z_proposal_coef', 0) > 0
-                    or self.config.get('use_dual_value_goals', False)
+                    or self._use_dual_value_goals()
                 )
             )
             or self.config.get('need_value_intraj_mask', False)
@@ -311,7 +314,7 @@ class GCDataset:
 
         batch['value_goals'] = self.get_goal_observations(value_goal_idxs)
         batch['actor_goals'] = self.get_goal_observations(actor_goal_idxs)
-        if self.config.get('use_dual_value_goals', False):
+        if self._use_dual_value_goals():
             intraj_mass = self.config['value_p_curgoal'] + self.config['value_p_trajgoal']
             intraj_p_cur = self.config['value_p_curgoal'] / intraj_mass
             value_goal_idxs_intraj = self.sample_goals(
@@ -342,6 +345,7 @@ class GCDataset:
             assert (idxs != final_state_idxs).all()
 
             value_midpoint_idxs_intraj = None
+            value_midpoint_idxs_intraj_support = None
             if need_intraj_mask:
                 batch['value_goals_is_intraj'] = value_is_intraj.astype(np.float32)
                 # For in-trajectory samples: midpoint between s and g on trajectory.
@@ -351,11 +355,11 @@ class GCDataset:
                 intraj_goal_idxs = np.maximum(intraj_goal_idxs, idxs + 1)
                 value_midpoint_idxs = np.random.randint(idxs, intraj_goal_idxs)
                 value_midpoint_idxs = np.where(value_is_intraj, value_midpoint_idxs, idxs)
-                if self.config.get('use_dual_value_goals', False):
+                if self._use_dual_value_goals():
                     intraj_midpoint_goal_idxs = np.maximum(value_goal_idxs_intraj, idxs + 1)
                     value_midpoint_idxs_intraj = np.random.randint(idxs, intraj_midpoint_goal_idxs)
             else:
-                if self.config.get('use_dual_value_goals', False):
+                if self._use_dual_value_goals():
                     mixed_midpoint_goal_idxs = np.maximum(value_goal_idxs, idxs + 1)
                     intraj_midpoint_goal_idxs = np.maximum(value_goal_idxs_intraj, idxs + 1)
                     value_midpoint_idxs = np.random.randint(idxs, mixed_midpoint_goal_idxs)
@@ -364,8 +368,21 @@ class GCDataset:
                     mixed_midpoint_goal_idxs = np.maximum(value_goal_idxs, idxs + 1)
                     value_midpoint_idxs = np.random.randint(idxs, mixed_midpoint_goal_idxs)
 
+            if (
+                self.config.get('agent_name') == 'cf_trl'
+                and self.config.get('z_proposal_source', 'learned') == 'intraj_support'
+            ):
+                intraj_support_k = int(self.config.get('z_proposal_intraj_support_k', 0))
+                if intraj_support_k > 0:
+                    intraj_support_goal_idxs = np.maximum(value_goal_idxs_intraj, idxs + 1)
+                    intraj_support_spans = intraj_support_goal_idxs - idxs
+                    intraj_support_u = np.random.rand(intraj_support_k, len(idxs))
+                    value_midpoint_idxs_intraj_support = idxs[None, :] + np.floor(
+                        intraj_support_u * intraj_support_spans[None, :]
+                    ).astype(int)
+
             batch['value_goal_observations'] = self.get_observations(value_goal_idxs)
-            if self.config.get('agent_name') in {'cf_trl', 'ltrl_hiql'}:
+            if self.config.get('agent_name') in {'cf_trl', 'cf_trl_flowq', 'trl', 'ltrl_hiql'}:
                 batch['actor_goal_observations'] = self.get_observations(actor_goal_idxs)
             else:
                 batch['actor_goal_observations'] = self.get_observations(value_goal_idxs)
@@ -381,20 +398,12 @@ class GCDataset:
                 value_nstep_idxs = np.minimum(idxs + value_n_step, final_state_idxs)
                 batch['value_nstep_observations'] = self.get_observations(value_nstep_idxs)
                 batch['value_nstep_steps'] = value_nstep_idxs - idxs
-            if self.config.get('use_dual_value_goals', False):
+            if self._use_dual_value_goals():
                 batch['value_goal_observations_intraj'] = self.get_observations(value_goal_idxs_intraj)
                 batch['value_goal_observations_random'] = self.get_observations(value_goal_idxs_random)
                 batch['value_goal_observations_cf'] = batch['value_goal_observations_random']
                 batch['value_offsets_intraj'] = value_goal_idxs_intraj - idxs
                 batch['value_midpoint_offsets_intraj'] = value_midpoint_idxs_intraj - idxs
-            random_support_k = int(self.config.get('z_proposal_random_goal_num_support', 0))
-            if self.config.get('agent_name') == 'cf_trl' and random_support_k > 0:
-                random_support_idxs = self.dataset.get_random_idxs(len(idxs) * random_support_k)
-                random_support_observations = self.get_observations(random_support_idxs)
-                batch['value_random_support_observations'] = jax.tree_util.tree_map(
-                    lambda arr: arr.reshape(len(idxs), random_support_k, *arr.shape[1:]),
-                    random_support_observations,
-                )
             if need_intraj_mask:
                 # Only compute offsets for intraj; cf offsets are meaningless
                 # (cross-trajectory) and would produce inf via discount^negative.
@@ -405,21 +414,25 @@ class GCDataset:
             batch['value_midpoint_observations'] = self.get_observations(value_midpoint_idxs)
             batch['value_midpoint_actions'] = self.dataset['actions'][value_midpoint_idxs]
             batch['next_actions'] = self.dataset['actions'][idxs + 1]
-            if self.config.get('use_dual_value_goals', False):
+            if self._use_dual_value_goals():
                 batch['value_midpoint_observations_intraj'] = self.get_observations(value_midpoint_idxs_intraj)
                 batch['value_midpoint_actions_intraj'] = self.dataset['actions'][value_midpoint_idxs_intraj]
+            if value_midpoint_idxs_intraj_support is not None:
+                batch['value_midpoint_observations_intraj_support'] = self.get_observations(
+                    value_midpoint_idxs_intraj_support
+                )
 
             if 'oracle_reps' in self.dataset:
                 batch['value_midpoint_goals'] = self.dataset['oracle_reps'][value_midpoint_idxs]
                 batch['value_cur_goals'] = self.dataset['oracle_reps'][idxs]
                 batch['value_next_goals'] = self.dataset['oracle_reps'][idxs + 1]
-                if self.config.get('use_dual_value_goals', False):
+                if self._use_dual_value_goals():
                     batch['value_midpoint_goals_intraj'] = self.dataset['oracle_reps'][value_midpoint_idxs_intraj]
             else:
                 batch['value_midpoint_goals'] = self.get_observations(value_midpoint_idxs)
                 batch['value_cur_goals'] = self.get_observations(idxs)
                 batch['value_next_goals'] = self.get_observations(idxs + 1)
-                if self.config.get('use_dual_value_goals', False):
+                if self._use_dual_value_goals():
                     batch['value_midpoint_goals_intraj'] = self.get_observations(value_midpoint_idxs_intraj)
 
             # Sample in-trajectory negatives for CRTR auxiliary loss.
@@ -464,7 +477,7 @@ class GCDataset:
                     )
                     if 'actor_nstep_observations' in batch:
                         aug_keys.append('actor_nstep_observations')
-                    if self.config.get('use_dual_value_goals', False):
+                    if self._use_dual_value_goals():
                         aug_keys.extend(
                             [
                                 'value_goals_intraj',
@@ -477,6 +490,8 @@ class GCDataset:
                                 'value_midpoint_goals_intraj',
                             ]
                         )
+                    if 'value_midpoint_observations_intraj_support' in batch:
+                        aug_keys.append('value_midpoint_observations_intraj_support')
                     if 'hierarchical_target_observations' in batch:
                         aug_keys.append('hierarchical_target_observations')
                 self.augment(batch, aug_keys)

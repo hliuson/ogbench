@@ -10,21 +10,19 @@ import optax
 from utils.encoders import encoder_modules
 from utils.flax_utils import ModuleDict, TrainState, nonpytree_field
 from utils.flows import imf_loss, imf_one_shot_sample
-from utils.networks import ActorVectorField, GCActor, GCDiscreteActor, GCValue
+from utils.networks import ActorVectorField, GCValue
 
 
 class CFTRLAgent(flax.struct.PyTreeNode):
-    """CF-TRL with AWR or flow-Q proposer objectives."""
+    """CF-TRL with an AWR-trained midpoint proposer."""
 
     rng: Any
     network: Any
     config: Any = nonpytree_field()
 
     @staticmethod
-    def _get_pe_info_from_config(config):
-        if config['pe_type'] == 'discrete':
-            return config['pe_discrete']
-        return config[config['pe_type']]
+    def _get_z_proposal_source_from_config(config):
+        return config.get('z_proposal_source', 'learned')
 
     @staticmethod
     def _validate_config(config):
@@ -40,30 +38,21 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             _require(abs(total - 1.0) <= 1e-6, f'{name} probabilities must sum to 1, got {probs} (sum={total})')
 
         _require(config['batch_size'] > 0, f'batch_size must be positive, got {config["batch_size"]}')
-        _require(config['cf_num_z_proposals'] >= 1, f'cf_num_z_proposals must be >= 1, got {config["cf_num_z_proposals"]}')
+        proposal_source = CFTRLAgent._get_z_proposal_source_from_config(config)
+        _require(
+            proposal_source in {'learned', 'intraj_support'},
+            f"z_proposal_source must be one of ['learned', 'intraj_support'], got {proposal_source!r}",
+        )
+        _require(
+            config['cf_num_z_proposals'] >= 1,
+            f'cf_num_z_proposals must be >= 1, got {config["cf_num_z_proposals"]}',
+        )
         _require(config['q_action_n_step'] >= 1, f'q_action_n_step must be >= 1, got {config["q_action_n_step"]}')
         _require(config['lr'] > 0.0, f'lr must be positive, got {config["lr"]}')
         _require(0.0 < config['discount'] <= 1.0, f'discount must be in (0, 1], got {config["discount"]}')
         _require(
-            np.isclose(config['z_proposal_coef'], 1.0),
-            f'cf_trl hard-codes z_proposal_coef=1.0, got {config["z_proposal_coef"]}',
-        )
-        _require(
-            int(config.get('z_proposal_random_goal_num_support', 0)) >= 0,
-            'z_proposal_random_goal_num_support must be non-negative',
-        )
-        _require(
-            config.get('z_proposal_learning_method', 'awr') in {'awr', 'flow_q', 'intraj'},
-            "z_proposal_learning_method must be one of 'awr', 'flow_q', or legacy alias 'intraj'",
-        )
-        _require(
-            float(config.get('z_proposal_flow_alpha', 1.0)) >= 0.0,
-            f'z_proposal_flow_alpha must be non-negative, got {config.get("z_proposal_flow_alpha", 1.0)}',
-        )
-        _require(config.get('use_dual_value_goals', True), 'cf_trl requires use_dual_value_goals=True')
-        _require(
-            config['pe_type'] in {'frs', 'rpg', 'discrete'},
-            f"pe_type must be one of 'frs', 'rpg', 'discrete', got {config['pe_type']}",
+            float(config.get('z_proposal_lr', 0.0)) >= 0.0,
+            f'z_proposal_lr must be non-negative, got {config.get("z_proposal_lr", 0.0)}',
         )
         _check_prob_mix(
             'value goal mix',
@@ -73,6 +62,50 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             'actor goal mix',
             [config['actor_p_curgoal'], config['actor_p_trajgoal'], config['actor_p_randomgoal']],
         )
+        _require(
+            config.get('pe_type', 'frs') == 'frs',
+            "cf_trl only supports FRS actor extraction",
+        )
+        _require(
+            not config.get('discrete', False),
+            'cf_trl does not support discrete action extraction',
+        )
+        if 'z_proposal_learning_method' in config:
+            _require(
+                config['z_proposal_learning_method'] == 'awr',
+                "cf_trl only supports the AWR proposer; use agents/cf_trl_flowq.py for flow_q",
+            )
+        _require(
+            not config.get('z_proposal_use_mixed_goals', False),
+            'cf_trl no longer supports mixed-goal proposer training',
+        )
+        _require(
+            not config.get('z_proposal_awr_use_v_denom', False),
+            'cf_trl always uses the raw AWR advantage',
+        )
+        _require(
+            int(config.get('value_goal_warmup_steps', 0)) == 0,
+            'cf_trl no longer supports value_goal_warmup_steps',
+        )
+        _require(
+            int(config.get('value_goal_mix_ramp_steps', 0)) == 0,
+            'cf_trl no longer supports value_goal_mix_ramp_steps',
+        )
+        if proposal_source == 'intraj_support':
+            _require(
+                int(config.get('z_proposal_intraj_support_k', 0)) >= 1,
+                (
+                    'z_proposal_intraj_support_k must be >= 1 when '
+                    f"z_proposal_source='intraj_support', got {config.get('z_proposal_intraj_support_k', 0)}"
+                ),
+            )
+            _require(
+                np.isclose(config['value_p_randomgoal'], 0.0),
+                (
+                    "z_proposal_source='intraj_support' is only defined for a fully in-trajectory value-goal mix; "
+                    f"got value_p_randomgoal={config['value_p_randomgoal']}"
+                ),
+            )
 
     @staticmethod
     def _raise_on_nonfinite_losses(step, total_loss, value_loss, z_proposal_loss, q_action_loss, actor_loss):
@@ -89,7 +122,7 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             raise FloatingPointError(f'Non-finite cf_trl losses at step {int(step)}: {bad_str}')
 
     def _get_pe_info(self):
-        return self._get_pe_info_from_config(self.config)
+        return self.config['frs']
 
     def _has_visual_encoder(self):
         encoder_name = self.config.get('encoder', '')
@@ -153,152 +186,22 @@ class CFTRLAgent(flax.struct.PyTreeNode):
     def _get_cf_num_z_proposals(self):
         return max(1, int(self.config.get('cf_num_z_proposals', 1)))
 
-    def _get_z_proposal_learning_method(self):
-        method = self.config.get('z_proposal_learning_method', 'awr')
-        if method == 'intraj':
-            return 'awr'
-        return method
+    def _get_z_proposal_source(self):
+        return self._get_z_proposal_source_from_config(self.config)
 
-    def _use_mixed_goals_for_proposal(self):
-        return bool(self.config.get('z_proposal_use_mixed_goals', False))
+    def _uses_intraj_support_proposals(self):
+        return self._get_z_proposal_source() == 'intraj_support'
+
+    def _get_z_proposal_intraj_support_k(self):
+        return max(1, int(self.config.get('z_proposal_intraj_support_k', 2)))
+
+    def _get_z_proposal_lr(self):
+        z_lr = float(self.config.get('z_proposal_lr', 0.0))
+        return z_lr if z_lr > 0.0 else float(self.config['lr'])
 
     def _select_value_training_batch(self, batch, step, rng=None):
-        """Optionally override the value-side goal source during early warmup.
-
-        When dual value goals are available, this ramps from explicit
-        in-trajectory goals toward the dataset's configured mixed value-goal
-        distribution, while leaving actor-side goals unchanged.
-        """
-        mix_ramp_steps = int(self.config.get('value_goal_mix_ramp_steps', 0))
-        if mix_ramp_steps > 0 and 'value_goal_observations_random' in batch:
-            progress = jnp.clip(step / float(mix_ramp_steps), 0.0, 1.0)
-            start_traj = float(self.config.get('value_goal_mix_start_trajgoal', self.config['value_p_trajgoal']))
-            start_random = float(
-                self.config.get('value_goal_mix_start_randomgoal', self.config['value_p_randomgoal'])
-            )
-            end_traj = float(self.config['value_p_trajgoal'])
-            end_random = float(self.config['value_p_randomgoal'])
-            traj_mass = start_traj + progress * (end_traj - start_traj)
-            random_mass = start_random + progress * (end_random - start_random)
-            total_mass = jnp.maximum(traj_mass + random_mass, 1e-8)
-            intraj_prob = traj_mass / total_mass
-
-            rng = self.rng if rng is None else rng
-            mix_rng = jax.random.fold_in(rng, step)
-            choose_intraj = jax.random.bernoulli(
-                mix_rng,
-                p=intraj_prob,
-                shape=batch['observations'].shape[:1],
-            )
-            choose_goal = choose_intraj[:, None]
-
-            selected_batch = dict(batch)
-            selected_batch['value_goals'] = jnp.where(
-                choose_goal,
-                batch['value_goals_intraj'],
-                batch['value_goals_random'],
-            )
-            selected_batch['value_goal_observations'] = jnp.where(
-                choose_goal,
-                batch['value_goal_observations_intraj'],
-                batch['value_goal_observations_random'],
-            )
-            selected_batch['value_offsets'] = jnp.where(
-                choose_intraj,
-                batch['value_offsets_intraj'],
-                jnp.zeros_like(batch['value_offsets']),
-            )
-            selected_batch['value_midpoint_offsets'] = jnp.where(
-                choose_intraj,
-                batch['value_midpoint_offsets_intraj'],
-                jnp.zeros_like(batch['value_midpoint_offsets']),
-            )
-            selected_batch['value_midpoint_observations'] = jnp.where(
-                choose_goal,
-                batch['value_midpoint_observations_intraj'],
-                batch['observations'],
-            )
-            selected_batch['value_midpoint_actions'] = jnp.where(
-                choose_goal,
-                batch['value_midpoint_actions_intraj'],
-                batch['actions'],
-            )
-            selected_batch['value_midpoint_goals'] = jnp.where(
-                choose_goal,
-                batch['value_midpoint_goals_intraj'],
-                batch['value_cur_goals'],
-            )
-            selected_batch['value_goals_is_intraj'] = choose_intraj.astype(batch['value_goals_is_intraj'].dtype)
-            return selected_batch, progress < 1.0, progress
-
-        warmup_steps = int(self.config.get('value_goal_warmup_steps', 0))
-        if warmup_steps <= 0:
-            return batch, False, 1.0
-        if 'value_goal_observations_intraj' not in batch:
-            return batch, False, 1.0
-
-        progress = jnp.clip(step / float(warmup_steps), 0.0, 1.0)
-        using_intraj_warmup = progress < 1.0
-
-        selected_batch = dict(batch)
-
-        rng = self.rng if rng is None else rng
-        ramp_rng = jax.random.fold_in(rng, step)
-        keep_mixed_random = jax.random.bernoulli(
-            ramp_rng, p=progress, shape=batch['value_goals_is_intraj'].shape
-        )
-        use_mixed_goal = jnp.logical_or(
-            batch['value_goals_is_intraj'] > 0.5,
-            keep_mixed_random,
-        )
-
-        goal_mask = use_mixed_goal[:, None]
-        selected_batch['value_goals'] = jnp.where(
-            goal_mask,
-            batch['value_goals'],
-            batch['value_goals_intraj'],
-        )
-        selected_batch['value_goal_observations'] = jnp.where(
-            goal_mask,
-            batch['value_goal_observations'],
-            batch['value_goal_observations_intraj'],
-        )
-        if 'value_midpoint_observations_intraj' in batch:
-            selected_batch['value_midpoint_observations'] = jnp.where(
-                goal_mask,
-                batch['value_midpoint_observations'],
-                batch['value_midpoint_observations_intraj'],
-            )
-        if 'value_midpoint_goals_intraj' in batch:
-            selected_batch['value_midpoint_goals'] = jnp.where(
-                goal_mask,
-                batch['value_midpoint_goals'],
-                batch['value_midpoint_goals_intraj'],
-            )
-        if 'value_midpoint_actions_intraj' in batch:
-            selected_batch['value_midpoint_actions'] = jnp.where(
-                goal_mask,
-                batch['value_midpoint_actions'],
-                batch['value_midpoint_actions_intraj'],
-            )
-        if 'value_offsets_intraj' in batch:
-            selected_batch['value_offsets'] = jnp.where(
-                use_mixed_goal,
-                batch['value_offsets'],
-                batch['value_offsets_intraj'],
-            )
-        if 'value_midpoint_offsets_intraj' in batch:
-            selected_batch['value_midpoint_offsets'] = jnp.where(
-                use_mixed_goal,
-                batch['value_midpoint_offsets'],
-                batch['value_midpoint_offsets_intraj'],
-            )
-        selected_batch['value_goals_is_intraj'] = jnp.where(
-            use_mixed_goal,
-            batch['value_goals_is_intraj'],
-            jnp.ones_like(batch['value_goals_is_intraj']),
-        )
-        return selected_batch, using_intraj_warmup, progress
+        del step, rng
+        return batch, False, 1.0
 
     def _select_intraj_proposal_training_batch(self, batch):
         """Select the in-trajectory proposer-training triples."""
@@ -324,19 +227,7 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         return selected_batch
 
     def _select_proposal_training_batch(self, batch, step, rng=None):
-        """Select proposer-training triples for the configured learning rule."""
         del step, rng
-        method = self._get_z_proposal_learning_method()
-        if method not in {'awr', 'flow_q'}:
-            raise ValueError(f'Unsupported z_proposal_learning_method: {method}')
-
-        if 'value_goals_is_intraj' not in batch:
-            raise ValueError('cf_trl requires value_goals_is_intraj in the proposer batch.')
-
-        if self._use_mixed_goals_for_proposal():
-            return dict(batch)
-        if method == 'awr' and int(self.config.get('z_proposal_random_goal_num_support', 0)) > 0:
-            return dict(batch)
         return self._select_intraj_proposal_training_batch(batch)
 
     def _score_support_candidates(self, observations, goals, candidates):
@@ -360,6 +251,18 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         first_v = self._aggregate_q_ensembles(jax.nn.sigmoid(first_v_logits)).reshape(batch_size, num_candidates)
         second_v = self._aggregate_q_ensembles(jax.nn.sigmoid(second_v_logits)).reshape(batch_size, num_candidates)
         return first_v * second_v, first_v, second_v
+
+    def _encode_intraj_support_candidates(self, support_observations, grad_params=None):
+        """Encode dataset-provided intraj midpoint supports into candidate z states."""
+        if support_observations.ndim < 3:
+            raise ValueError(
+                'Expected value_midpoint_observations_intraj_support to have shape [K, B, ...], '
+                f'got {support_observations.shape}'
+            )
+        num_candidates, batch_size = support_observations.shape[:2]
+        flat_support = support_observations.reshape((num_candidates * batch_size, *support_observations.shape[2:]))
+        flat_encoded = self._encode_visual(flat_support, grad_params=grad_params)
+        return flat_encoded.reshape((num_candidates, batch_size, *flat_encoded.shape[1:]))
 
     def _distance_weight_from_value(self, v_base):
         """Compute TRL-style distance weights from a base value estimate V(s, g)."""
@@ -445,14 +348,14 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             'u_g': u_g,
         }
 
-    def _evaluate_proposed_q_values(self, u_s, u_g, z_proposed):
+    def _evaluate_proposed_q_values_per_sample(self, u_s, u_g, z_proposed):
         """Evaluate proposed midpoint candidates with factorized V(s, w) * V(w, g)."""
         if z_proposed.ndim == 2:
             first_v_logits = self.network.select('target_value')(u_s, goals=z_proposed)
             second_v_logits = self.network.select('target_value')(z_proposed, goals=u_g)
             first_v = self._aggregate_q_ensembles(jax.nn.sigmoid(first_v_logits))
             second_v = self._aggregate_q_ensembles(jax.nn.sigmoid(second_v_logits))
-            return first_v * second_v
+            return (first_v * second_v)[None, :]
 
         num_cf_samples = z_proposed.shape[0]
         obs_bc = jnp.broadcast_to(u_s[None], (num_cf_samples, *u_s.shape))
@@ -468,7 +371,10 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         )
         first_v = self._aggregate_q_ensembles(jax.nn.sigmoid(first_v_logits)).reshape(num_cf_samples, -1)
         second_v = self._aggregate_q_ensembles(jax.nn.sigmoid(second_v_logits)).reshape(num_cf_samples, -1)
-        return (first_v * second_v).max(axis=0)
+        return first_v * second_v
+
+    def _evaluate_proposed_q_values(self, u_s, u_g, z_proposed):
+        return self._evaluate_proposed_q_values_per_sample(u_s, u_g, z_proposed).max(axis=0)
 
     def _value_loss_grounded(self, batch, grad_params, rng=None, value_ctx=None, proposal_ctx=None):
         """Use grounded factorized-V targets plus proposal-side CF stitching."""
@@ -485,20 +391,40 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         target_traj = direct_target
         is_intraj = batch['value_goals_is_intraj']
 
-        proposed_beats_traj = None
-        z_proposed = self._sample_z_proposal(
-            batch,
-            rng,
-            num_samples=self._get_cf_num_z_proposals(),
-            observations=None if proposal_ctx is None else proposal_ctx['u_s'],
-            goals=None if proposal_ctx is None else proposal_ctx['u_g'],
-        )
-        z_proposed = jax.lax.stop_gradient(z_proposed)
-        target_proposed = self._evaluate_proposed_q_values(u_s, u_g, z_proposed)
-        proposed_beats_traj = target_proposed > target_traj
+        using_intraj_support = self._uses_intraj_support_proposals()
+        if using_intraj_support:
+            if 'value_midpoint_observations_intraj_support' not in batch:
+                raise ValueError(
+                    "cf_trl with z_proposal_source='intraj_support' requires "
+                    'value_midpoint_observations_intraj_support in the batch.'
+                )
+            z_candidates = self._encode_intraj_support_candidates(
+                batch['value_midpoint_observations_intraj_support'],
+                grad_params=grad_params,
+            )
+        else:
+            # Keep intraj rows as a two-way comparison: max(traj, one learned proposal).
+            # For random-goal rows, use max over two learned proposals for parity.
+            z_candidates = self._sample_z_proposal(
+                batch,
+                rng,
+                num_samples=max(2, self._get_cf_num_z_proposals()),
+                observations=None if proposal_ctx is None else proposal_ctx['u_s'],
+                goals=None if proposal_ctx is None else proposal_ctx['u_g'],
+            )
+            z_candidates = jax.lax.stop_gradient(z_candidates)
 
-        intraj_target = jnp.maximum(target_traj, target_proposed)
-        target = jnp.where(is_intraj, intraj_target, target_proposed)
+        if using_intraj_support:
+            target_aux = self._evaluate_proposed_q_values(u_s, u_g, z_candidates)
+        else:
+            proposed_q_values = self._evaluate_proposed_q_values_per_sample(u_s, u_g, z_candidates)
+            target_aux_intraj = proposed_q_values[0]
+            target_aux_random = proposed_q_values.max(axis=0)
+            target_aux = jnp.where(is_intraj, target_aux_intraj, target_aux_random)
+        aux_beats_traj = target_aux > target_traj
+
+        intraj_target = jnp.maximum(target_traj, target_aux)
+        target = jnp.where(is_intraj, intraj_target, target_aux)
 
         tau = jnp.where(
             is_intraj,
@@ -538,71 +464,57 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             'calibration_rel_gap_mean': calib_mean,
             'calibration_rel_gap_max': calib_max,
             'target_traj_mean': target_traj.mean(),
+            'value_backup_uses_intraj_support': jnp.asarray(using_intraj_support, dtype=jnp.float32),
         }
-        info['target_proposed_mean'] = target_proposed.mean()
+        info['target_aux_mean'] = target_aux.mean()
+        info['target_proposed_mean'] = target_aux.mean()
         intraj_denom = jnp.maximum(is_intraj.sum(), 1.0)
         info['cf_override_frac_intraj'] = (
-            proposed_beats_traj.astype(jnp.float32) * is_intraj
+            aux_beats_traj.astype(jnp.float32) * is_intraj
         ).sum() / intraj_denom
-        info['cf_override_frac_all'] = proposed_beats_traj.astype(jnp.float32).mean()
+        info['cf_override_frac_all'] = aux_beats_traj.astype(jnp.float32).mean()
         cf_mask = 1.0 - is_intraj
+        if using_intraj_support:
+            info['num_intraj_supports'] = jnp.asarray(self._get_z_proposal_intraj_support_k(), dtype=jnp.float32)
+        else:
+            info['num_learned_supports_random'] = jnp.asarray(max(2, self._get_cf_num_z_proposals()), dtype=jnp.float32)
 
         def _masked_mean(x, mask):
             denom = jnp.maximum(mask.sum(), 1.0)
             return (x * mask).sum() / denom
 
-        info['target_proposed_mean_intraj'] = _masked_mean(target_proposed, is_intraj)
-        info['target_proposed_mean_cf'] = _masked_mean(target_proposed, cf_mask)
+        info['target_aux_mean_intraj'] = _masked_mean(target_aux, is_intraj)
+        info['target_aux_mean_cf'] = _masked_mean(target_aux, cf_mask)
+        info['target_proposed_mean_intraj'] = _masked_mean(target_aux, is_intraj)
+        info['target_proposed_mean_cf'] = _masked_mean(target_aux, cf_mask)
         info['target_traj_mean_intraj'] = _masked_mean(target_traj, is_intraj)
         info['target_traj_mean_cf'] = _masked_mean(target_traj, cf_mask)
         return total_loss, info
 
-    def _compute_z_proposal_awr_loss(self, awr_batch, grad_params, rng):
-        """Train the z-proposal network with support-AWR over candidate midpoints."""
+    def _prepare_z_proposal_midpoint_regularizer(self, awr_batch):
+        """Build midpoint regularizer targets and optional AWR weights."""
         awr_beta = self.config.get('z_proposal_awr_beta', 0.0)
-        random_support_k = int(self.config.get('z_proposal_random_goal_num_support', 0))
         intraj_mask = awr_batch.get('value_goals_is_intraj', None)
         flow_observations = self._encode_visual(awr_batch['observations'])
         flow_goals = self._encode_visual(awr_batch['value_goal_observations'])
         if intraj_mask is None:
             raise ValueError('cf_trl requires value_goals_is_intraj in the proposer batch.')
-        z_target_intraj = self._encode_visual(awr_batch['value_midpoint_observations'])
-        z_target_intraj = jax.lax.stop_gradient(z_target_intraj)
-        random_goal_mask = (intraj_mask <= 0.5).astype(z_target_intraj.dtype)
-        z_target = z_target_intraj
-        support_scores = None
-        best_support_scores = None
+        z_target = self._encode_visual(awr_batch['value_midpoint_observations'])
+        z_target = jax.lax.stop_gradient(z_target)
         proposal_mask = None
-
-        if random_support_k > 0:
-            if 'value_random_support_observations' not in awr_batch:
-                raise ValueError('cf_trl requires value_random_support_observations when random support is enabled.')
-            support_observations = awr_batch['value_random_support_observations']
-            batch_size, num_support = support_observations.shape[:2]
-            support_flat = support_observations.reshape(batch_size * num_support, *support_observations.shape[2:])
-            support_targets = self._encode_visual(support_flat)
-            support_targets = jax.lax.stop_gradient(support_targets)
-            support_targets = support_targets.reshape(batch_size, num_support, support_targets.shape[-1])
-            support_scores, _, _ = self._score_support_candidates(flow_observations, flow_goals, support_targets)
-            best_support_idxs = jnp.argmax(support_scores, axis=1)
-            best_support_targets = support_targets[jnp.arange(batch_size), best_support_idxs]
-            best_support_scores = support_scores[jnp.arange(batch_size), best_support_idxs]
-            z_target = jnp.where(random_goal_mask[:, None] > 0, best_support_targets, z_target_intraj)
 
         if awr_beta > 0.0:
             intraj_scores, _, _ = self._score_support_candidates(
                 flow_observations,
                 flow_goals,
-                z_target_intraj[:, None, :],
+                z_target[:, None, :],
             )
             midpoint_scores = intraj_scores[:, 0]
-            if best_support_scores is not None:
-                midpoint_scores = jnp.where(random_goal_mask > 0, best_support_scores, midpoint_scores)
 
             v_logits = self.network.select('target_value')(flow_observations, goals=flow_goals)
             v_base = self._aggregate_q_ensembles(jax.nn.sigmoid(v_logits))
             awr_adv = jax.lax.stop_gradient(midpoint_scores - v_base)
-            awr_score = awr_adv / (v_base + 0.001)
+            awr_score = awr_adv
             awr_weight = jnp.exp(awr_beta * awr_score).astype(z_target.dtype)
 
             awr_max_weight = self.config.get('z_proposal_awr_max_weight', 20.0)
@@ -614,6 +526,29 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             awr_adv = None
             awr_weight = None
             has_positive = None
+
+        info = {}
+        if intraj_mask is not None:
+            info['intraj_frac'] = intraj_mask.mean()
+            info['random_goal_frac'] = 1.0 - intraj_mask.mean()
+        if awr_adv is not None:
+            info['awr_adv_mean'] = awr_adv.mean()
+            info['awr_score_mean'] = awr_score.mean()
+            info['awr_positive_frac'] = has_positive.astype(z_target.dtype).mean()
+            info['awr_weight_mean'] = awr_weight.mean()
+            info['awr_weight_max'] = awr_weight.max()
+            info['awr_base_v_mean'] = v_base.mean()
+            awr_max_weight = self.config.get('z_proposal_awr_max_weight', 20.0)
+            if awr_max_weight is not None and awr_max_weight > 0:
+                info['awr_weight_cap_frac'] = (awr_weight >= (awr_max_weight - 1e-6)).mean()
+
+        return flow_observations, flow_goals, z_target, proposal_mask, info
+
+    def _compute_z_proposal_awr_loss(self, awr_batch, grad_params, rng):
+        """Train the z-proposal network with AWR-weighted midpoint targets."""
+        flow_observations, flow_goals, z_target, proposal_mask, info = self._prepare_z_proposal_midpoint_regularizer(
+            awr_batch
+        )
 
         def vector_field_fn(noise, times):
             return self.network.select('z_proposal')(
@@ -627,24 +562,8 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             mask=proposal_mask,
         )
 
-        info = {'loss': loss}
-        if intraj_mask is not None:
-            info['intraj_frac'] = intraj_mask.mean()
-            info['random_goal_frac'] = 1.0 - intraj_mask.mean()
-        if support_scores is not None:
-            random_rows = random_goal_mask[:, None]
-            info['random_support_score_mean'] = self._masked_mean(support_scores, random_rows)
-            info['random_support_top1_score_mean'] = self._masked_mean(best_support_scores, random_goal_mask)
-        if awr_adv is not None:
-            info['awr_adv_mean'] = awr_adv.mean()
-            info['awr_positive_frac'] = has_positive.astype(z_target.dtype).mean()
-            info['awr_weight_mean'] = awr_weight.mean()
-            info['awr_weight_max'] = awr_weight.max()
-            info['awr_base_v_mean'] = v_base.mean()
-            awr_max_weight = self.config.get('z_proposal_awr_max_weight', 20.0)
-            if awr_max_weight is not None and awr_max_weight > 0:
-                info['awr_weight_cap_frac'] = (awr_weight >= (awr_max_weight - 1e-6)).mean()
-
+        info = dict(info)
+        info['loss'] = loss
         for k, v in flow_info.items():
             if k != 'loss':
                 info[k] = v
@@ -695,66 +614,14 @@ class CFTRLAgent(flax.struct.PyTreeNode):
 
         return imf_one_shot_sample(rng, sample_shape, vector_field_fn)
 
-    def _z_proposal_flow_q_loss(self, batch, grad_params, rng, step=0):
-        """Train the z-proposal network with Q-learning plus intraj flow regularization."""
-        q_rng, awr_rng = jax.random.split(rng)
-        flow_q_batch = self._select_proposal_training_batch(batch, step, rng=None)
-        flow_observations = self._encode_visual(flow_q_batch['observations'])
-        flow_goals = self._encode_visual(flow_q_batch['value_goal_observations'])
-        z_proposed = self._sample_z_proposal(
-            flow_q_batch,
-            q_rng,
-            num_samples=1,
-            observations=flow_observations,
-            goals=flow_goals,
-            grad_params=grad_params,
-        )
-
-        first_v_logits = self.network.select('target_value')(flow_observations, goals=z_proposed)
-        second_v_logits = self.network.select('target_value')(z_proposed, goals=flow_goals)
-        first_v = self._aggregate_q_ensembles(jax.nn.sigmoid(first_v_logits))
-        second_v = self._aggregate_q_ensembles(jax.nn.sigmoid(second_v_logits))
-        flow_q = first_v * second_v
-        q_loss = -flow_q.mean()
-        flow_alpha = float(self.config.get('z_proposal_flow_alpha', 1.0))
-        awr_batch = self._select_intraj_proposal_training_batch(batch)
-        flow_loss, flow_info = self._compute_z_proposal_awr_loss(awr_batch, grad_params, awr_rng)
-        loss = q_loss + flow_alpha * flow_loss
-
-        info = {
-            'loss': loss,
-            'q_loss': q_loss,
-            'flow_loss': flow_loss,
-            'flow_alpha': jnp.asarray(flow_alpha, dtype=flow_q.dtype),
-            'flow_q_mean': flow_q.mean(),
-            'flow_q_max': flow_q.max(),
-            'flow_q_min': flow_q.min(),
-            'flow_q_first_v_mean': first_v.mean(),
-            'flow_q_second_v_mean': second_v.mean(),
-            'sample_norm_mean': jnp.linalg.norm(z_proposed, axis=-1).mean(),
-        }
-
-        if 'value_goals_is_intraj' in flow_q_batch:
-            intraj_mask = flow_q_batch['value_goals_is_intraj']
-            cf_mask = 1.0 - intraj_mask
-            info['intraj_frac'] = intraj_mask.mean()
-            info['random_goal_frac'] = cf_mask.mean()
-            info['flow_q_mean_intraj'] = self._masked_mean(flow_q, intraj_mask)
-            info['flow_q_mean_cf'] = self._masked_mean(flow_q, cf_mask)
-
-        for k, v in flow_info.items():
-            if k != 'loss':
-                info[f'awr_{k}'] = v
-
-        return loss, info
-
     def z_proposal_loss(self, batch, grad_params, rng, step=0):
-        method = self._get_z_proposal_learning_method()
-        if method == 'awr':
-            return self._z_proposal_awr_loss(batch, grad_params, rng, step=step)
-        if method == 'flow_q':
-            return self._z_proposal_flow_q_loss(batch, grad_params, rng, step=step)
-        raise ValueError(f'Unsupported z_proposal_learning_method: {method}')
+        if self._uses_intraj_support_proposals():
+            zero = jnp.asarray(0.0, dtype=jnp.float32)
+            return zero, {
+                'loss': zero,
+                'disabled': jnp.asarray(1.0, dtype=jnp.float32),
+            }
+        return self._z_proposal_awr_loss(batch, grad_params, rng, step=step)
 
     def _sample_z_proposal(self, batch, rng, num_samples=1, observations=None, goals=None, grad_params=None):
         """Sample z candidates from the z-proposal network via iMF one-shot."""
@@ -831,83 +698,32 @@ class CFTRLAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng=None, policy_ctx=None):
         """Flat actor loss (same policy extraction interface as TRL)."""
-        pe_info = self._get_pe_info()
-
         if policy_ctx is None:
             actor_observations, actor_goals = self._encode_policy_inputs(
                 batch['observations'],
                 batch['actor_goals'],
                 grad_params=grad_params,
             )
-            actor_goal_u = self._encode_visual(batch['actor_goal_observations'])
         else:
             actor_observations = policy_ctx['actor_observations']
             actor_goals = policy_ctx['actor_goals']
-            actor_goal_u = policy_ctx['actor_goal_u']
+        batch_size, action_dim = batch['actions'].shape
+        x_rng, t_rng = jax.random.split(rng, 2)
 
-        if self.config['pe_type'] == 'rpg':
-            dist = self.network.select('actor')(actor_observations, actor_goals, params=grad_params)
+        x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
+        x_1 = batch['actions']
+        t = jax.random.uniform(t_rng, (batch_size, 1))
+        x_t = (1 - t) * x_0 + t * x_1
+        y = x_1 - x_0
 
-            u_next = self._encode_visual(batch['next_observations'])
-            v_next = self.network.select('value')(u_next, goals=actor_goal_u)
-            v = jnp.minimum(v_next[0], v_next[1])
+        pred = self.network.select('actor')(
+            actor_observations, actor_goals, x_t, t, params=grad_params,
+        )
+        actor_loss = jnp.mean((pred - y) ** 2)
 
-            v_loss = -v.mean() / jax.lax.stop_gradient(jnp.abs(v).mean() + 1e-6)
-            log_prob = dist.log_prob(batch['actions'])
-            bc_loss = -(pe_info['alpha'] * log_prob).mean()
-
-            actor_loss = v_loss + bc_loss
-            return actor_loss, {
-                'actor_loss': actor_loss,
-                'v_loss': v_loss.mean(),
-                'bc_loss': bc_loss,
-                'v_mean': v.mean(),
-                'v_abs_mean': jnp.abs(v).mean(),
-                'bc_log_prob': log_prob.mean(),
-                'mse': jnp.mean((dist.mode() - batch['actions']) ** 2),
-                'std': jnp.mean(dist.scale_diag),
-            }
-
-        if self.config['pe_type'] == 'discrete':
-            dist = self.network.select('actor')(actor_observations, actor_goals, params=grad_params)
-
-            u_next = self._encode_visual(batch['next_observations'])
-            v = self.network.select('value')(u_next, goals=actor_goal_u).mean(axis=0)
-            v_loss = -v.mean()
-
-            log_prob = dist.log_prob(batch['actions'])
-            bc_loss = -(pe_info['alpha'] * log_prob).mean()
-            actor_loss = v_loss + bc_loss
-
-            return actor_loss, {
-                'actor_loss': actor_loss,
-                'v_loss': v_loss.mean(),
-                'bc_loss': bc_loss,
-                'v_mean': v.mean(),
-                'v_abs_mean': jnp.abs(v).mean(),
-                'bc_log_prob': log_prob.mean(),
-            }
-
-        if self.config['pe_type'] == 'frs':
-            batch_size, action_dim = batch['actions'].shape
-            x_rng, t_rng = jax.random.split(rng, 2)
-
-            x_0 = jax.random.normal(x_rng, (batch_size, action_dim))
-            x_1 = batch['actions']
-            t = jax.random.uniform(t_rng, (batch_size, 1))
-            x_t = (1 - t) * x_0 + t * x_1
-            y = x_1 - x_0
-
-            pred = self.network.select('actor')(
-                actor_observations, actor_goals, x_t, t, params=grad_params,
-            )
-            actor_loss = jnp.mean((pred - y) ** 2)
-
-            return actor_loss, {
-                'actor_loss': actor_loss,
-            }
-
-        raise ValueError(f"Unsupported pe_type: {self.config['pe_type']}")
+        return actor_loss, {
+            'actor_loss': actor_loss,
+        }
 
     @jax.jit
     def total_loss(self, batch, grad_params, rng=None, step=0):
@@ -1005,48 +821,39 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         seed=None,
         temperature=1.0,
     ):
+        del temperature
         pe_info = self._get_pe_info()
         observations, goals = self._encode_policy_inputs(observations, goals)
+        n_observations = jnp.repeat(jnp.expand_dims(observations, 0), pe_info['num_samples'], axis=0)
+        n_goals = jnp.repeat(jnp.expand_dims(goals, 0), pe_info['num_samples'], axis=0)
 
-        if self.config['pe_type'] == 'frs':
-            n_observations = jnp.repeat(jnp.expand_dims(observations, 0), pe_info['num_samples'], axis=0)
-            n_goals = jnp.repeat(jnp.expand_dims(goals, 0), pe_info['num_samples'], axis=0)
-
-            n_actions = jax.random.normal(
-                seed,
-                (
-                    pe_info['num_samples'],
-                    *observations.shape[:-1],
-                    self.config['action_dim'],
-                ),
+        n_actions = jax.random.normal(
+            seed,
+            (
+                pe_info['num_samples'],
+                *observations.shape[:-1],
+                self.config['action_dim'],
+            ),
+        )
+        for i in range(pe_info['flow_steps']):
+            t = jnp.full(
+                (pe_info['num_samples'], *observations.shape[:-1], 1),
+                i / pe_info['flow_steps'],
             )
-            for i in range(pe_info['flow_steps']):
-                t = jnp.full(
-                    (pe_info['num_samples'], *observations.shape[:-1], 1),
-                    i / pe_info['flow_steps'],
-                )
-                vels = self.network.select('actor')(n_observations, n_goals, n_actions, t)
-                n_actions = n_actions + vels / pe_info['flow_steps']
-            n_actions = jnp.clip(n_actions, -1, 1)
+            vels = self.network.select('actor')(n_observations, n_goals, n_actions, t)
+            n_actions = n_actions + vels / pe_info['flow_steps']
+        n_actions = jnp.clip(n_actions, -1, 1)
 
-            q_action = self.network.select('q_action')(
-                n_observations,
-                goals=n_goals,
-                actions=n_actions,
-            )
+        q_action = self.network.select('q_action')(
+            n_observations,
+            goals=n_goals,
+            actions=n_actions,
+        )
 
-            if len(observations.shape) == 2:
-                actions = n_actions[jnp.argmax(q_action, axis=0), jnp.arange(observations.shape[0])]
-            else:
-                actions = n_actions[jnp.argmax(q_action)]
-
-            return actions
-
-        dist = self.network.select('actor')(observations, goals, temperature=temperature)
-        actions = dist.sample(seed=seed)
-
-        if self.config['pe_type'] != 'discrete':
-            actions = jnp.clip(actions, -1, 1)
+        if len(observations.shape) == 2:
+            actions = n_actions[jnp.argmax(q_action, axis=0), jnp.arange(observations.shape[0])]
+        else:
+            actions = n_actions[jnp.argmax(q_action)]
 
         return actions
 
@@ -1066,7 +873,6 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         ex_goals = example_batch['actor_goals']
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
-        pe_info = cls._get_pe_info_from_config(config)
         raw_observation_shape = tuple(ex_observations.shape[1:])
         encoder_name = config.get('encoder', None)
         if encoder_name in (None, ''):
@@ -1107,40 +913,21 @@ class CFTRLAgent(flax.struct.PyTreeNode):
             action_dim=midpoint_dim,
             layer_norm=config['layer_norm'],
         )
-
-        if config['pe_type'] == 'frs':
-            actor_def = ActorVectorField(
-                hidden_dims=config['actor_hidden_dims'],
-                action_dim=action_dim,
-                layer_norm=config['layer_norm'],
-            )
-            ex_actor_in = (ex_encoded_observations, ex_encoded_goals, ex_actions, ex_times)
-        elif config['pe_type'] == 'discrete':
-            actor_def = GCDiscreteActor(
-                hidden_dims=config['actor_hidden_dims'],
-                action_dim=config['pe_discrete']['action_ct'],
-                layer_norm=config['layer_norm'],
-            )
-            ex_actor_in = (ex_encoded_observations, ex_encoded_goals, ex_actions)
-        elif config['pe_type'] == 'rpg':
-            actor_def = GCActor(
-                hidden_dims=config['actor_hidden_dims'],
-                action_dim=action_dim,
-                layer_norm=config['layer_norm'],
-                state_dependent_std=False,
-                const_std=pe_info['const_std'],
-            )
-            ex_actor_in = (ex_encoded_observations, ex_encoded_goals, ex_actions)
-        else:
-            raise ValueError(f"Unsupported pe_type: {config['pe_type']}")
+        actor_def = ActorVectorField(
+            hidden_dims=config['actor_hidden_dims'],
+            action_dim=action_dim,
+            layer_norm=config['layer_norm'],
+        )
+        ex_actor_in = (ex_encoded_observations, ex_encoded_goals, ex_actions, ex_times)
 
         network_info = dict(
             value=(value_def, (ex_u, ex_u)),
             target_value=(copy.deepcopy(value_def), (ex_u, ex_u)),
             q_action=(q_action_def, (ex_encoded_observations, ex_encoded_goals, ex_actions)),
-            z_proposal=(z_proposal_def, (ex_u, ex_u, ex_z, ex_z_times)),
             actor=(actor_def, ex_actor_in),
         )
+        if cls._get_z_proposal_source_from_config(config) == 'learned':
+            network_info['z_proposal'] = (z_proposal_def, (ex_u, ex_u, ex_z, ex_z_times))
         if encoder_def is not None:
             network_info['encoder'] = (encoder_def, (ex_observations,))
 
@@ -1148,8 +935,26 @@ class CFTRLAgent(flax.struct.PyTreeNode):
         network_args = {k: v[1] for k, v in network_info.items()}
 
         network_def = ModuleDict(networks)
-        network_tx = optax.adam(learning_rate=config['lr'])
         network_params = network_def.init(init_rng, **network_args)['params']
+
+        z_proposal_lr = float(config.get('z_proposal_lr', 0.0))
+        if z_proposal_lr > 0.0 and not np.isclose(z_proposal_lr, config['lr']):
+            def _label_from_path(path, _):
+                top_key = getattr(path[0], 'key', None) if path else None
+                if top_key == 'modules_z_proposal':
+                    return 'proposal'
+                return 'default'
+
+            param_labels = jax.tree_util.tree_map_with_path(_label_from_path, network_params)
+            network_tx = optax.multi_transform(
+                {
+                    'default': optax.adam(learning_rate=config['lr']),
+                    'proposal': optax.adam(learning_rate=z_proposal_lr),
+                },
+                param_labels,
+            )
+        else:
+            network_tx = optax.adam(learning_rate=config['lr'])
 
         network = TrainState.create(network_def, network_params, tx=network_tx)
 
@@ -1178,29 +983,18 @@ def get_config():
             cf_expectile=0.7,
             encoder='',
             freeze_encoder=False,
-            z_proposal_coef=1.0,
-            z_proposal_learning_method='awr',
-            z_proposal_use_mixed_goals=True,
-            z_proposal_awr_beta=1.0,
+            z_proposal_source='learned',
+            z_proposal_intraj_support_k=2,
+            z_proposal_awr_beta=10.0,
             z_proposal_awr_max_weight=20.0,
-            z_proposal_flow_alpha=1.0,
+            z_proposal_lr=3e-3,
             cf_num_z_proposals=1,
-            pe_type='frs',  # frs, rpg, discrete
             frs=ml_collections.ConfigDict(dict(flow_steps=10, num_samples=32)),
-            rpg=ml_collections.ConfigDict(dict(alpha=0.03, const_std=True)),
-            pe_discrete=ml_collections.ConfigDict(dict(alpha=0.03, action_ct=0)),
-            discrete=False,
             dataset_class='GCDataset',
             value_p_curgoal=0.0,
             value_p_trajgoal=0.8,
             value_p_randomgoal=0.2,
             value_geom_sample=True,
-            use_dual_value_goals=True,
-            value_goal_warmup_steps=0,
-            value_goal_mix_ramp_steps=0,
-            value_goal_mix_start_trajgoal=0.8,
-            value_goal_mix_start_randomgoal=0.2,
-            z_proposal_random_goal_num_support=0,
             q_action_n_step=25,
             actor_p_curgoal=0.0,
             actor_p_trajgoal=0.5,

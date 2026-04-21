@@ -19,6 +19,17 @@ class TRLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
     network: Any
     config: Any = nonpytree_field()
 
+    def _get_value_goal_inputs(self, batch):
+        """Keep the TRL value function in state-observation goal space."""
+        return batch.get('value_goal_observations', batch['value_goals'])
+
+    def _get_value_midpoint_goal_inputs(self, batch):
+        return batch.get('value_midpoint_observations', batch['value_midpoint_goals'])
+
+    def _get_value_bootstrap_goals(self, batch):
+        """Policy extraction still uses oracle goals, but value bootstraps use state goals."""
+        return batch.get('actor_goal_observations', batch['actor_goals'])
+
     def _distance_weight_from_value(self, base_v):
         if self.config.get('lam', 0.0) <= 0:
             ones = jnp.ones_like(base_v)
@@ -29,16 +40,18 @@ class TRLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
         return dist_weight, implied_dist
 
     def value_loss(self, batch, grad_params):
+        value_goals = self._get_value_goal_inputs(batch)
+        midpoint_goals = self._get_value_midpoint_goal_inputs(batch)
         v_logits = self.network.select('value')(
             batch['observations'],
-            goals=batch['value_goals'],
+            goals=value_goals,
             params=grad_params,
         )
         vs = jax.nn.sigmoid(v_logits)
 
         first_v_logits = self.network.select('target_value')(
             batch['observations'],
-            goals=batch['value_midpoint_goals'],
+            goals=midpoint_goals,
         )
         first_v = jnp.where(
             (batch['value_midpoint_offsets'] <= 1)[None, ...],
@@ -48,7 +61,7 @@ class TRLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
 
         second_v_logits = self.network.select('target_value')(
             batch['value_midpoint_observations'],
-            goals=batch['value_goals'],
+            goals=value_goals,
         )
         second_offset = batch['value_offsets'][None, ...] - batch['value_midpoint_offsets']
         second_v = jnp.where(
@@ -128,7 +141,7 @@ class TRLAgent(flax.struct.PyTreeNode, QActionPolicyExtractionMixin):
         ex_observations = example_batch['observations']
         ex_actions = example_batch['actions']
         ex_actor_goals = example_batch['actor_goals']
-        ex_value_goals = example_batch['value_goals']
+        ex_value_goals = example_batch.get('value_goal_observations', example_batch['value_goals'])
         ex_times = ex_actions[..., :1]
         action_dim = ex_actions.shape[-1]
         pe_info = cls._get_pe_info_from_config(config)

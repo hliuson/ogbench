@@ -83,6 +83,8 @@ def _resolve_preprocess_frame_stack(*datasets):
 
 
 def main(_):
+    config = FLAGS.agent
+
     # Set up logger.
     exp_name = get_exp_name(FLAGS.seed)
     setup_wandb(
@@ -98,7 +100,6 @@ def main(_):
         json.dump(flag_dict, f)
 
     # Set up environment and dataset.
-    config = FLAGS.agent
 
     # Check if dataset_path is a directory (sharded dataset)
     dataset_shards = None
@@ -144,11 +145,13 @@ def main(_):
     np.random.seed(FLAGS.seed)
 
     example_batch = train_dataset.sample(1)
-    if config['discrete']:
+    if config.get('discrete', False):
         # Fill with the maximum action to let the agent know the action space size.
         example_batch['actions'] = np.full_like(example_batch['actions'], env.action_space.n - 1)
 
     agent_class = agents[config['agent_name']]
+    update_supports_step = 'step' in inspect.signature(agent_class.update).parameters
+    total_loss_supports_step = 'step' in inspect.signature(agent_class.total_loss).parameters
     # Some agents (sharsa) take example_batch directly to support oracle rep mode.
     sig = inspect.signature(agent_class.create)
     if 'example_batch' in sig.parameters:
@@ -237,13 +240,7 @@ def main(_):
 
         # Update agent.
         batch = train_dataset.sample(config['batch_size'])
-        # Pass step to agents that support schedule-dependent behavior.
-        if (
-            'high_actor_warmup_steps' in config
-            or 'cf_warmup_steps' in config
-            or 'cf_burnin_steps' in config
-            or 'value_goal_warmup_steps' in config
-        ):
+        if update_supports_step:
             agent, update_info = agent.update(batch, step=i)
         else:
             agent, update_info = agent.update(batch)
@@ -253,12 +250,7 @@ def main(_):
             train_metrics = {f'training/{k}': v for k, v in update_info.items()}
             if val_dataset is not None:
                 val_batch = val_dataset.sample(config['batch_size'])
-                if (
-                    'high_actor_warmup_steps' in config
-                    or 'cf_warmup_steps' in config
-                    or 'cf_burnin_steps' in config
-                    or 'value_goal_warmup_steps' in config
-                ):
+                if total_loss_supports_step:
                     _, val_info = agent.total_loss(val_batch, grad_params=None, step=i)
                 else:
                     _, val_info = agent.total_loss(val_batch, grad_params=None)
