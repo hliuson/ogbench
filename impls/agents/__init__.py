@@ -3,6 +3,7 @@ from agents.cf_trl_flowq import CFTRLFlowQAgent
 from agents.crl import CRLAgent
 from agents.gcbc import GCBCAgent
 from agents.gciql import GCIQLAgent
+from agents.gciql_dyna_nstep import DynaNStepGCIQLAgent
 from agents.gciql_nstep import NStepGCIQLAgent
 from agents.gcivl import GCIVLAgent
 from agents.hiql import HIQLAgent
@@ -20,6 +21,7 @@ agents = dict(
     crl=CRLAgent,
     gcbc=GCBCAgent,
     gciql=GCIQLAgent,
+    gciql_dyna_nstep=DynaNStepGCIQLAgent,
     gciql_nstep=NStepGCIQLAgent,
     gcivl=GCIVLAgent,
     hiql=HIQLAgent,
